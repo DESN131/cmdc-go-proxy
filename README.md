@@ -115,7 +115,22 @@ print(response.output_text)
 | `POST /v1/responses` | OpenAI Responses API |
 | `POST /v1/messages` | Anthropic Messages API |
 | `GET /v1/models` | Models available on the configured plan |
+| `GET /v1/usage` | Account, plan, credits, and usage summary |
+| `GET /v1/usage/whoami` | Account information |
+| `GET /v1/usage/subscription` | Subscription plan and billing period |
+| `GET /v1/usage/credits` | Monthly credits and current usage windows |
+| `GET /v1/usage/summary` | Usage totals and daily breakdown |
 | `GET /health` | Local proxy health check |
+
+### Usage
+
+The usage endpoints call Command Code's official `whoami`, billing, and usage services with the local login:
+
+```powershell
+curl http://127.0.0.1:8787/v1/usage
+```
+
+The aggregate response contains `account`, `subscription`, `credits`, and `summary`. Use the individual `/v1/usage/...` endpoints when only one section is needed. Query parameters on `/v1/usage` and `/v1/usage/summary`, such as `since`, are forwarded upstream.
 
 ## Model IDs
 

@@ -106,6 +106,21 @@ async function handle(request, response) {
     return
   }
 
+  if (request.method === "GET" && (url.pathname === "/v1/usage" || url.pathname === "/usage")) {
+    await proxyUsage(response, url.searchParams)
+    return
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/v1/usage/")) {
+    await proxyUsageDetail(response, url.pathname.slice("/v1/usage/".length), url.searchParams)
+    return
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/usage/")) {
+    await proxyUsageDetail(response, url.pathname.slice("/usage/".length), url.searchParams)
+    return
+  }
+
   if (request.method === "POST" && url.pathname.endsWith("/chat/completions")) {
     await proxyChat(request, response)
     return
@@ -124,7 +139,7 @@ async function handle(request, response) {
   json(response, 404, {
     error: {
       type: "not_found",
-      message: "Use /v1/chat/completions, /v1/responses, /v1/messages, /v1/models or /health",
+      message: "Use /v1/chat/completions, /v1/responses, /v1/messages, /v1/models, /v1/usage or /health",
     },
   })
 }
@@ -649,6 +664,109 @@ function readAuthKey() {
     throw new HttpError(401, `No apiKey found in ${AUTH_PATH}. Run "cmdc login" first.`)
   }
   return data.apiKey
+}
+
+function usageHeaders() {
+  return {
+    accept: "application/json",
+    authorization: `Bearer ${readAuthKey()}`,
+    "user-agent": "cli",
+    "x-command-code-version": CLI_VERSION,
+    "x-cli-environment": CLI_ENVIRONMENT,
+    "x-project-slug": PROJECT_SLUG,
+    "x-taste-learning": TASTE_LEARNING,
+    "x-session-id": crypto.randomUUID(),
+  }
+}
+
+async function fetchUsageJson(endpoint, params) {
+  const url = new URL(`${BASE_URL}${endpoint}`)
+  for (const [key, value] of params) {
+    if (value.length > 0) url.searchParams.set(key, value)
+  }
+  const upstream = await fetch(url, { headers: usageHeaders() }).catch((error) => ({ error }))
+  if ("error" in upstream) {
+    throw new HttpError(502, upstream.error instanceof Error ? upstream.error.message : String(upstream.error))
+  }
+  const text = await upstream.text()
+  if (!upstream.ok) throw new HttpError(upstream.status, text || `Command Code usage request failed (${upstream.status})`)
+  const data = parseJson(text)
+  if (!data) throw new HttpError(502, "Command Code returned an invalid usage response")
+  return data
+}
+
+async function proxyUsage(response, params) {
+  const [whoami, subscription, credits, summary] = await Promise.all([
+    fetchUsageJson("/alpha/whoami", new URLSearchParams()),
+    fetchUsageJson("/alpha/billing/subscriptions", new URLSearchParams()),
+    fetchUsageJson("/alpha/billing/credits", new URLSearchParams()),
+    fetchUsageJson("/alpha/usage/summary", params),
+  ])
+  json(response, 200, {
+    account: usageAccount(whoami),
+    subscription: usageSubscription(subscription),
+    credits: usageCredits(credits),
+    summary,
+  })
+}
+
+async function proxyUsageDetail(response, detail, params) {
+  const endpoints = {
+    whoami: "/alpha/whoami",
+    subscription: "/alpha/billing/subscriptions",
+    subscriptions: "/alpha/billing/subscriptions",
+    credits: "/alpha/billing/credits",
+    summary: "/alpha/usage/summary",
+    usage: "/alpha/usage/summary",
+  }
+  const name = detail.replace(/\/+$/, "")
+  const endpoint = endpoints[name]
+  if (!endpoint) throw new HttpError(404, `Unknown usage endpoint "${detail}"`)
+  const data = await fetchUsageJson(endpoint, params)
+  if (name === "whoami") return json(response, 200, usageAccount(data))
+  if (name === "subscription" || name === "subscriptions") return json(response, 200, usageSubscription(data))
+  if (name === "credits") return json(response, 200, usageCredits(data))
+  json(response, 200, data)
+}
+
+function usageAccount(data) {
+  const user = data?.user && typeof data.user === "object" ? data.user : {}
+  const org = data?.org && typeof data.org === "object" ? data.org : undefined
+  return {
+    user: {
+      ...(user.id ? { id: user.id } : {}),
+      ...(user.name ? { name: user.name } : {}),
+      ...(user.userName ? { userName: user.userName } : {}),
+    },
+    ...(org
+      ? {
+          org: {
+            ...(org.id ? { id: org.id } : {}),
+            ...(org.name ? { name: org.name } : {}),
+          },
+        }
+      : { org: null }),
+  }
+}
+
+function usageSubscription(data) {
+  const item = data?.data && typeof data.data === "object" ? data.data : {}
+  return {
+    ...(item.planId ? { planId: item.planId } : {}),
+    ...(item.status ? { status: item.status } : {}),
+    ...(item.currentPeriodStart ? { currentPeriodStart: item.currentPeriodStart } : {}),
+    ...(item.currentPeriodEnd ? { currentPeriodEnd: item.currentPeriodEnd } : {}),
+    ...(typeof item.cancelAtPeriodEnd === "boolean" ? { cancelAtPeriodEnd: item.cancelAtPeriodEnd } : {}),
+  }
+}
+
+function usageCredits(data) {
+  return {
+    credits: data?.credits ?? null,
+    windowLimits: data?.windowLimits ?? null,
+    sandboxAccess: data?.sandboxAccess ?? null,
+    sandboxMinutes: data?.sandboxMinutes ?? null,
+  }
 }
 
 function authStatus() {

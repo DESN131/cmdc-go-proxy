@@ -115,7 +115,22 @@ print(response.output_text)
 | `POST /v1/responses` | OpenAI Responses API |
 | `POST /v1/messages` | Anthropic Messages API |
 | `GET /v1/models` | 当前套餐可用的模型 |
+| `GET /v1/usage` | 账号、订阅、额度和用量汇总 |
+| `GET /v1/usage/whoami` | 账号信息 |
+| `GET /v1/usage/subscription` | 订阅套餐和计费周期 |
+| `GET /v1/usage/credits` | 月度额度及当前用量窗口 |
+| `GET /v1/usage/summary` | 用量总计和每日明细 |
 | `GET /health` | 本地代理健康检查 |
+
+### 用量查询
+
+用量端点使用本机登录信息调用 Command Code 官方的账号、账单和用量服务：
+
+```powershell
+curl http://127.0.0.1:8787/v1/usage
+```
+
+聚合响应包含 `account`、`subscription`、`credits` 和 `summary`。只需要其中一部分时，可调用对应的 `/v1/usage/...` 单项端点。`/v1/usage` 和 `/v1/usage/summary` 上的查询参数（例如 `since`）会透传到上游。
 
 ## 模型 ID
 
