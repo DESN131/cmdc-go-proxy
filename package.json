@@ -1,0 +1,14 @@
+{
+  "name": "cmdc-go-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible proxy for Command Code Go models.",
+  "scripts": {
+    "start": "node cmdc-proxy.mjs",
+    "check": "node --check cmdc-proxy.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
