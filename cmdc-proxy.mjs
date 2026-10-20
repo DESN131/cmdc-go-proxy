@@ -730,23 +730,12 @@ async function runCommandCode(request, response, input, protocol, model, wantsSt
 function repairToolCallHistory(messages) {
   const repaired = []
   const pending = new Map()
-  let synthesized = 0
-  let dropped = 0
-  let mergedUsers = 0
-
-  const pushMessage = (message) => {
-    const last = repaired[repaired.length - 1]
-    if (message.role === "user" && last?.role === "user") {
-      last.content = [...(Array.isArray(last.content) ? last.content : []), ...(message.content ?? [])]
-      mergedUsers += 1
-      return
-    }
-    repaired.push(message)
-  }
+  const synthesized = []
+  const dropped = []
 
   const flushPending = () => {
     for (const [id, name] of pending) {
-      pushMessage({
+      repaired.push({
         role: "tool",
         content: [
           {
@@ -757,44 +746,47 @@ function repairToolCallHistory(messages) {
           },
         ],
       })
-      synthesized += 1
+      synthesized.push(id)
     }
     pending.clear()
   }
 
-  for (const message of messages) {
+  for (const [messageIndex, message] of messages.entries()) {
     if (!message || typeof message !== "object") continue
     if (message.role === "assistant") {
       flushPending()
-      for (const block of Array.isArray(message.content) ? message.content : []) {
+      for (const [blockIndex, block] of (Array.isArray(message.content) ? message.content : []).entries()) {
         if (block?.type !== "tool-call") continue
-        const id = block.toolCallId || `call_${randomID()}`
+        const id = block.toolCallId || `call_${messageIndex}_${blockIndex}`
         block.toolCallId = id
         pending.set(id, block.toolName || "unknown")
       }
-      pushMessage(message)
+      repaired.push(message)
       continue
     }
     if (message.role === "tool") {
       const matched = []
       for (const block of Array.isArray(message.content) ? message.content : []) {
         if (block?.type !== "tool-result" || !block.toolCallId || !pending.has(block.toolCallId)) {
-          dropped += 1
+          dropped.push(block?.toolCallId || "(missing id)")
           continue
         }
         pending.delete(block.toolCallId)
         matched.push(block)
       }
-      if (matched.length > 0) pushMessage({ role: "tool", content: matched })
+      if (matched.length > 0) repaired.push({ role: "tool", content: matched })
       continue
     }
     flushPending()
-    pushMessage(message)
+    repaired.push(message)
   }
   flushPending()
 
-  if (synthesized || dropped || mergedUsers) {
-    logWarn(`repaired tool history: synthesized=${synthesized} dropped=${dropped} merged_users=${mergedUsers}`)
+  if (synthesized.length > 0 || dropped.length > 0) {
+    logWarn(`repaired tool history: synthesized=${synthesized.length} dropped=${dropped.length}`)
+    if (DEBUG_ENABLED) {
+      logInfo(`tool history detail: synthesized=[${synthesized.join(",")}] dropped=[${dropped.join(",")}]`)
+    }
   }
   return repaired
 }
@@ -870,14 +862,14 @@ function anthropicToCommandCode(input) {
     if (!message || typeof message !== "object") continue
     if (message.role === "assistant") {
       const content = []
-      for (const block of anthropicBlocks(message.content)) {
+      for (const [blockIndex, block] of anthropicBlocks(message.content).entries()) {
         if (block.type === "text" && typeof block.text === "string") content.push({ type: "text", text: block.text })
         if (block.type === "thinking" && typeof block.thinking === "string") {
           content.push({ type: "reasoning", text: stripThinkControl(block.thinking) })
         }
         if (block.type === "redacted_thinking") content.push({ type: "reasoning", text: "" })
         if (block.type === "tool_use") {
-          const id = block.id ?? `call_${randomID()}`
+          const id = block.id ?? `call_${messageIndex}_${blockIndex}`
           const name = block.name ?? ""
           const upstreamName = resolveToolName(toolRegistry, name) || "unknown"
           toolNames.set(id, upstreamName)
@@ -1045,7 +1037,7 @@ function responsesToCommandCode(input) {
     }
 
     if (item.type === "function_call") {
-      const id = item.call_id ?? item.id ?? `call_${randomID()}`
+      const id = item.call_id ?? item.id ?? `call_${itemIndex}`
       const toolName = resolveToolName(toolRegistry, item.name ?? "", item.namespace) || "unknown"
       callNames.set(id, toolName)
       const reasoning = takeReasoning()
@@ -1065,7 +1057,7 @@ function responsesToCommandCode(input) {
     }
 
     if (item.type === "custom_tool_call") {
-      const id = item.call_id ?? item.id ?? `call_${randomID()}`
+      const id = item.call_id ?? item.id ?? `call_${itemIndex}`
       const toolName = resolveToolName(toolRegistry, item.name ?? "", item.namespace) || "unknown"
       callNames.set(id, toolName)
       const reasoning = takeReasoning()

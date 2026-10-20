@@ -111,8 +111,8 @@ print(response.output_text)
 - Translates Command Code's newline-delimited event stream into the client protocol.
 - Supports streaming and non-streaming requests, function tools, Codex custom tools, namespaced tools, reasoning content, and usage.
 - Replays assistant reasoning on later turns and keeps a stable upstream thread per client conversation. If a stream ends before completion, the proxy closes it with a valid terminal event and rotates the upstream thread so the next turn can continue.
-- Repairs incomplete tool-call history before forwarding: missing tool results are filled with an interrupted-result marker, orphan results are dropped, and consecutive user messages are merged.
-- Preserves empty assistant turns with a short placeholder so repeated empty responses do not collapse the conversation into one oversized user message.
+- Repairs incomplete tool-call history before forwarding: missing tool results are filled with an interrupted-result marker and orphan results are dropped. Consecutive user messages are forwarded unchanged.
+- Preserves empty assistant turns with a short placeholder instead of dropping them, so role order and conversation boundaries stay intact.
 - Enforces an upstream transport size guard. By default, oversized requests are rejected with `context_length_exceeded`; history is never rewritten.
 
 ### Codex / Responses tools
