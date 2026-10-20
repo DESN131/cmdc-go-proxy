@@ -34,6 +34,10 @@ node cmdc-proxy.mjs
 
 默认地址：`http://127.0.0.1:8787/v1`。
 
+如果首选端口已被占用，代理会自动尝试后续端口（最多 `PORT_ATTEMPTS` 个），并在启动日志中打印实际监听地址。
+
+每个请求日志包含时间、状态码、模型、流式模式、输入/输出/总 token、缓存与推理 token、总耗时、首 token 延迟（TTFT）、实际生成窗口，以及按该窗口计算的输出速度（tok/s）。
+
 ### 客户端配置
 
 | 配置项 | 值 |
@@ -106,7 +110,10 @@ print(response.output_text)
 - 自动添加 Command Code CLI 所需的请求头。
 - 将 Command Code 的逐行事件流转换为客户端协议。
 - 支持流式、非流式、函数工具、Codex 自定义工具、命名空间工具、推理内容和 usage。
-- 在后续轮次回放助手推理，并为同一客户端会话保持稳定的上游线程。
+- 在后续轮次回放助手推理，并为同一客户端会话保持稳定的上游线程。上游流提前结束时，代理会补发合法终止事件并自动切换上游线程，下一轮可继续对话。
+- 转发前修复不完整的工具调用历史：缺失的工具结果会补为“执行被中断”的结果，孤立的工具结果会被丢弃，连续的用户消息会合并。
+- 空的助手轮次会用占位消息保留，避免多次空响应把整个对话合并成一条超长用户消息。
+- 提供上游传输层体积保护。默认超限请求会返回 `context_length_exceeded`，代理不会改写历史。
 
 ### Codex / Responses 工具
 
@@ -181,6 +188,8 @@ Command Code 接受 `off`、`low`、`medium`、`high`、`xhigh`、`max`。代理
 | --- | --- | --- |
 | `PORT` | `8787` | 监听端口 |
 | `HOST` | `127.0.0.1` | 监听地址 |
+| `PORT_ATTEMPTS` | `20` | 首选端口被占用时，最多向后尝试的连续端口数 |
+| `LOG_TIME_ZONE` | `Asia/Hong_Kong` | 日志时间戳使用的时区 |
 | `CMDC_BASE_URL` | `https://api.commandcode.ai` | 上游基础地址 |
 | `CMDC_AUTH_PATH` | `~/.commandcode/auth.json` | Command Code 登录文件 |
 | `COMMAND_CODE_API_KEY` | 未设置 | 覆盖登录 Key |
@@ -195,6 +204,26 @@ Command Code 接受 `off`、`low`、`medium`、`high`、`xhigh`、`max`。代理
 | `CMDC_PERMISSION_MODE` | `standard` | Command Code 权限模式（`standard`、`plan`、`auto-accept`；`bypass` 映射为 `auto-accept`） |
 | `CMDC_MODE` | `agent` | 上游生成模式（`agent`、`learning`、`custom-agent`、`custom-agent-create`、`title-gen`、`tool-desc`、`compact`、`vision`） |
 | `CMDC_ZDR` | 未设置 | 设为 `1` 时发送 `x-cmd-zdr` |
+| `CMDC_DEBUG` | 未设置 | 设为 `1` 时写入逐请求的 JSONL 诊断日志 |
+| `CMDC_DEBUG_DIR` | `<工作目录>/.cmdc-debug` | 调试日志目录；设置该变量也会启用 debug 模式 |
+| `CMDC_CONTEXT_MODE` | `error` | `error` 直接拒绝超限请求且不改写历史；`auto` 超限时移除旧图片；`passthrough` 关闭保护；`strip-images` 总是移除旧图片 |
+| `CMDC_MAX_REQUEST_BYTES` | `8388608` | `auto` 和 `error` 模式使用的软阈值 |
+| `CMDC_HARD_REQUEST_BYTES` | `12582912` | 硬上限；超过时返回 `context_length_exceeded` |
+
+## 调试
+
+启动代理前启用 debug 模式：
+
+```powershell
+$env:CMDC_DEBUG = "1"
+npm start
+```
+
+每个请求会在 `.cmdc-debug/` 下生成一个 JSONL 文件，包含客户端请求、转换后的上游请求、脱敏后的请求头、上游响应状态与响应头、每条上游原始数据及其时间偏移，以及最终的 usage/错误结果。启动日志会打印 `debug log: ...` 路径。
+
+也可以在单个请求中发送 `x-cmdc-debug: 1` 请求头，无需重启代理。Authorization 和 API Key 请求头会被脱敏，但提示词、工具输出和模型输出会原样记录；分享日志前请先检查内容。
+
+对话压缩仍由 harness 负责。默认的 `error` 模式不改写历史，因此能保持上游提示词缓存的前缀：harness 在明确的压缩边界处理一次后，后续追加消息可以继续命中缓存。`auto` 和 `strip-images` 只是兼容性兜底；从历史中间删除图片会让第一张被改动的图片之后全部缓存失效。
 
 ## 限制
 

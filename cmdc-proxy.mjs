@@ -21,7 +21,10 @@ import path from "node:path"
 import crypto from "node:crypto"
 import zlib from "node:zlib"
 
-const PORT = Number(process.env.PORT ?? 8787)
+const CONFIGURED_PORT = Number(process.env.PORT ?? 8787)
+const PORT = Number.isInteger(CONFIGURED_PORT) && CONFIGURED_PORT >= 0 ? CONFIGURED_PORT : 8787
+const CONFIGURED_ATTEMPTS = Number(process.env.PORT_ATTEMPTS ?? 20)
+const PORT_ATTEMPTS = Number.isFinite(CONFIGURED_ATTEMPTS) ? Math.max(1, Math.floor(CONFIGURED_ATTEMPTS)) : 20
 const HOST = process.env.HOST ?? "127.0.0.1"
 const BASE_URL = (process.env.CMDC_BASE_URL ?? "https://api.commandcode.ai").replace(/\/+$/, "")
 const AUTH_PATH = process.env.CMDC_AUTH_PATH ?? path.join(os.homedir(), ".commandcode", "auth.json")
@@ -62,6 +65,247 @@ const MODEL_ALIASES = {
   "deepseek-v4-pro": "deepseek/deepseek-v4-pro",
 }
 
+const rotatedThreadIds = new Map()
+
+function resolveThreadId(threadId) {
+  return rotatedThreadIds.get(threadId) ?? threadId
+}
+
+function rotateThreadId(threadId) {
+  if (!threadId) return
+  const next = crypto.randomUUID()
+  rotatedThreadIds.set(threadId, next)
+  logWarn(`reset upstream thread ${threadId.slice(0, 8)} -> ${next.slice(0, 8)} after incomplete stream`)
+}
+
+const LOG_TIME_ZONE = process.env.LOG_TIME_ZONE ?? "Asia/Hong_Kong"
+const LOG_TIME_FORMAT = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: LOG_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  fractionalSecondDigits: 3,
+  hour12: false,
+})
+const DEBUG_ENABLED =
+  ["1", "true", "yes", "on"].includes(String(process.env.CMDC_DEBUG ?? "").trim().toLowerCase()) ||
+  Boolean(process.env.CMDC_DEBUG_DIR)
+const DEBUG_DIR = path.resolve(process.env.CMDC_DEBUG_DIR ?? path.join(WORKDIR, ".cmdc-debug"))
+const CONTEXT_MODES = new Set(["auto", "passthrough", "strip-images", "error"])
+const CONTEXT_MODE = CONTEXT_MODES.has(process.env.CMDC_CONTEXT_MODE)
+  ? process.env.CMDC_CONTEXT_MODE
+  : "error"
+const configuredMaxBytes = Number(process.env.CMDC_MAX_REQUEST_BYTES ?? 8 * 1024 * 1024)
+const MAX_REQUEST_BYTES =
+  Number.isFinite(configuredMaxBytes) && configuredMaxBytes > 0
+    ? Math.floor(configuredMaxBytes)
+    : 8 * 1024 * 1024
+const configuredHardBytes = Number(process.env.CMDC_HARD_REQUEST_BYTES ?? 12 * 1024 * 1024)
+const HARD_REQUEST_BYTES =
+  Number.isFinite(configuredHardBytes) && configuredHardBytes > 0
+    ? Math.floor(configuredHardBytes)
+    : 12 * 1024 * 1024
+
+function logTimestamp() {
+  return LOG_TIME_FORMAT.format(new Date()).replace(",", ".")
+}
+
+function logLine(level, message) {
+  const line = `[${logTimestamp()}] [cmdc-proxy] ${message}`
+  if (level === "error") console.error(line)
+  else if (level === "warn") console.warn(line)
+  else console.log(line)
+}
+
+function logInfo(message) {
+  logLine("log", message)
+}
+
+function logWarn(message) {
+  logLine("warn", message)
+}
+
+function logError(message) {
+  logLine("error", message)
+}
+
+function redactedHeaders(headers) {
+  const result = {}
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    result[key] = ["authorization", "x-api-key", "cookie", "set-cookie"].includes(key.toLowerCase())
+      ? "[redacted]"
+      : value
+  }
+  return result
+}
+
+function createDebugLog(protocol, request) {
+  const requested =
+    DEBUG_ENABLED || String(request?.headers?.["x-cmdc-debug"] ?? "").trim() === "1"
+  if (!requested) return null
+
+  try {
+    fs.mkdirSync(DEBUG_DIR, { recursive: true })
+    const file = path.join(
+      DEBUG_DIR,
+      `${new Date().toISOString().replace(/[:.]/g, "-")}-${protocol}-${randomID()}.jsonl`,
+    )
+    const fd = fs.openSync(file, "a")
+    let sequence = 0
+    let closed = false
+    const write = (type, data = {}) => {
+      if (closed) return
+      try {
+        fs.writeSync(fd, `${JSON.stringify({ ts: new Date().toISOString(), seq: sequence++, type, ...data })}\n`)
+      } catch (error) {
+        logError(`debug write failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    write("session_start", {
+      protocol,
+      pid: process.pid,
+      upstream: BASE_URL,
+      workdir: WORKDIR,
+      request: { method: request.method, url: request.url },
+      headers: redactedHeaders(request.headers),
+    })
+    logInfo(`debug log: ${file}`)
+    return {
+      file,
+      write,
+      close() {
+        if (closed) return
+        closed = true
+        try {
+          fs.closeSync(fd)
+        } catch {
+          // The debug file is diagnostic; closing must not affect the proxy.
+        }
+      },
+    }
+  } catch (error) {
+    logError(`could not create debug log: ${error instanceof Error ? error.message : String(error)}`)
+    return null
+  }
+}
+
+function finishDebug(debug, stats, extra = {}) {
+  if (!debug) return
+  debug.write("result", {
+    status: stats?.status ?? null,
+    usage: stats?.usage ?? null,
+    error: stats?.error ?? null,
+    elapsedMs: stats ? Math.max(0, Date.now() - stats.startedAt) : null,
+    firstOutputAt: stats?.firstOutputAt ?? null,
+    lastOutputAt: stats?.lastOutputAt ?? null,
+    ...extra,
+  })
+  debug.write("session_end")
+  debug.close()
+}
+
+function requestShape(body) {
+  const params = body?.params ?? {}
+  const messages = Array.isArray(params.messages) ? params.messages : []
+  const roles = {}
+  let toolCalls = 0
+  let toolResults = 0
+  for (const message of messages) {
+    roles[message?.role ?? "unknown"] = (roles[message?.role ?? "unknown"] ?? 0) + 1
+    for (const block of Array.isArray(message?.content) ? message.content : []) {
+      if (block?.type === "tool-call") toolCalls += 1
+      if (block?.type === "tool-result") toolResults += 1
+    }
+  }
+  return {
+    messages: messages.length,
+    roles,
+    toolCalls,
+    toolResults,
+    tools: Array.isArray(params.tools) ? params.tools.length : 0,
+    maxTokens: params.max_tokens ?? null,
+    chars: JSON.stringify(body ?? {}).length,
+  }
+}
+
+function createRequestStats(protocol, model, stream) {
+  return {
+    protocol,
+    model: String(model ?? "unknown"),
+    stream,
+    startedAt: Date.now(),
+    firstOutputAt: null,
+    lastOutputAt: null,
+    status: null,
+    usage: null,
+    error: null,
+  }
+}
+
+function markOutput(stats) {
+  if (!stats) return
+  const now = Date.now()
+  if (stats.firstOutputAt === null) stats.firstOutputAt = now
+  stats.lastOutputAt = now
+}
+
+function usageSnapshot(usage) {
+  if (!usage) return undefined
+  const input = usage.inputTokens ?? usage.prompt_tokens ?? 0
+  const output = usage.outputTokens ?? usage.completion_tokens ?? 0
+  return {
+    input,
+    output,
+    total: usage.totalTokens ?? usage.total_tokens ?? input + output,
+    cached:
+      usage.inputTokenDetails?.cacheReadTokens ??
+      usage.prompt_tokens_details?.cached_tokens ??
+      usage.cache_read_input_tokens ??
+      0,
+    reasoning:
+      usage.outputTokenDetails?.reasoningTokens ??
+      usage.completion_tokens_details?.reasoning_tokens ??
+      0,
+  }
+}
+
+function formatDuration(ms) {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${Math.round(ms)}ms`
+}
+
+function logRequest(stats) {
+  const elapsedMs = Math.max(0, Date.now() - stats.startedAt)
+  const usage = usageSnapshot(stats.usage)
+  const tokens = usage
+    ? `tokens=${usage.input}/${usage.output}/${usage.total} cached=${usage.cached} reasoning=${usage.reasoning}`
+    : "tokens=unknown"
+  const ttftMs = stats.firstOutputAt === null ? null : Math.max(0, stats.firstOutputAt - stats.startedAt)
+  const generationMs =
+    stats.firstOutputAt === null || stats.lastOutputAt === null
+      ? null
+      : Math.max(0, stats.lastOutputAt - stats.firstOutputAt)
+  // Token speed uses the observed generation window; total latency includes queueing and TTFT.
+  const speedWindowMs = generationMs !== null && generationMs > 0 ? generationMs : elapsedMs
+  const speed = usage && usage.output > 0 && speedWindowMs > 0
+    ? (usage.output / (speedWindowMs / 1000)).toFixed(1)
+    : "0.0"
+  const ttft = ttftMs === null ? "" : ` ttft=${formatDuration(ttftMs)}`
+  const generation = generationMs !== null && generationMs > 0 ? ` gen=${formatDuration(generationMs)}` : ""
+  const status = stats.status ? `${stats.status} ` : ""
+  const errorText =
+    stats.error && typeof stats.error === "object"
+      ? (stats.error.message ?? JSON.stringify(stats.error))
+      : stats.error
+  const error = errorText ? ` error=${String(errorText).slice(0, 200)}` : ""
+  logLine(
+    stats.error ? "error" : "log",
+    `${status}${stats.protocol} model=${stats.model} stream=${stats.stream} ${tokens} elapsed=${formatDuration(elapsedMs)}${ttft}${generation} speed=${speed}tok/s${error}`,
+  )
+}
+
 const PLAN_RANK = {
   "individual-go": 1,
   "individual-go-v1": 1,
@@ -78,36 +322,67 @@ let catalogCache
 let catalogCacheAt = 0
 
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, code) {
     super(message)
     this.status = status
+    this.code = code
   }
 }
 
-const server = http.createServer((request, response) => {
+function handleRequest(request, response) {
   handle(request, response).catch((error) => {
     if (error?.name === "AbortError") return
     const status = typeof error?.status === "number" ? error.status : 500
-    console.error(`[cmdc-proxy] ${error instanceof Error ? error.message : String(error)}`)
+    logError(error instanceof Error ? error.message : String(error))
     if (!response.headersSent) {
       json(response, status, {
         error: {
-          type: "proxy_error",
+          type: error?.code === "context_length_exceeded" ? "invalid_request_error" : "proxy_error",
           message: error instanceof Error ? error.message : String(error),
+          ...(error?.code ? { code: error.code } : {}),
         },
       })
       return
     }
     response.end()
   })
-})
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`[cmdc-proxy] listening on http://${HOST}:${PORT}/v1`)
-  console.log(`[cmdc-proxy] upstream ${BASE_URL}`)
-  console.log(`[cmdc-proxy] plan ${PLAN}`)
-  console.log(`[cmdc-proxy] workdir ${WORKDIR}`)
-})
+startServer()
+
+function startServer(attempt = 0) {
+  const port = PORT === 0 ? 0 : PORT + attempt
+  const server = http.createServer(handleRequest)
+  const onListenError = (error) => {
+    const canRetry =
+      error?.code === "EADDRINUSE" &&
+      PORT !== 0 &&
+      attempt + 1 < PORT_ATTEMPTS &&
+      PORT + attempt + 1 <= 65535
+    if (canRetry) {
+      logWarn(`port ${port} is in use, trying ${PORT + attempt + 1}`)
+      setImmediate(() => startServer(attempt + 1))
+      return
+    }
+    logError(`failed to listen on ${HOST}:${port}: ${error instanceof Error ? error.message : String(error)}`)
+    process.exitCode = 1
+  }
+  server.once("error", onListenError)
+  server.listen(port, HOST, () => {
+    server.off("error", onListenError)
+    server.on("error", (error) => {
+      logError(`server error: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    const address = server.address()
+    const actualPort = typeof address === "object" && address ? address.port : port
+    logInfo(`listening on http://${HOST}:${actualPort}/v1`)
+    logInfo(`upstream ${BASE_URL}`)
+    logInfo(`plan ${PLAN}`)
+    logInfo(`workdir ${WORKDIR}`)
+    logInfo(`debug ${DEBUG_ENABLED ? DEBUG_DIR : "off"}`)
+    logInfo(`context ${CONTEXT_MODE} soft=${MAX_REQUEST_BYTES} hard=${HARD_REQUEST_BYTES}`)
+  })
+}
 
 async function handle(request, response) {
   setCors(response)
@@ -184,27 +459,51 @@ async function proxyChat(request, response) {
 
   const wantsStream = input.stream === true
   const model = await resolveModel(input.model)
-  const threadId = threadIdFrom(request.headers, input)
+  const clientThreadId = threadIdFrom(request.headers, input)
+  const threadId = resolveThreadId(clientThreadId)
+  const stats = createRequestStats("chat", model, wantsStream)
+  const debug = createDebugLog("chat", request)
+  stats.debug = debug
+  if (debug) response.on("close", () => setImmediate(() => finishDebug(debug, stats)))
   const controller = new AbortController()
   response.on("close", () => controller.abort())
   const converted = openAIToCommandCode({ ...input, model })
+  const headers = buildHeaders(threadId)
+  const upstreamBody = buildGenerateBody(converted, threadId)
+  const context = applyContextGuard(upstreamBody)
+  debug?.write("client_request", { protocol: "chat", headers: redactedHeaders(request.headers), body: input })
+  debug?.write("upstream_request", { threadId, headers: redactedHeaders(headers), body: upstreamBody, context })
 
   const upstream = await fetch(`${BASE_URL}/alpha/generate`, {
     method: "POST",
-    headers: buildHeaders(threadId),
-    body: JSON.stringify(buildGenerateBody(converted, threadId)),
+    headers,
+    body: JSON.stringify(upstreamBody),
     signal: controller.signal,
-  }).catch((error) => ({ error }))
+  }).catch((error) => {
+    debug?.write("fetch_error", { message: error instanceof Error ? error.message : String(error) })
+    return { error }
+  })
+
+  if (!("error" in upstream)) {
+    debug?.write("upstream_response", {
+      status: upstream.status,
+      headers: redactedHeaders(Object.fromEntries(upstream.headers)),
+    })
+  }
 
   if ("error" in upstream) {
     if (upstream.error?.name === "AbortError") {
+      stats.error = "aborted"
+      logRequest(stats)
       response.end()
       return
     }
+    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
+    logRequest(stats)
     throw new HttpError(502, upstream.error instanceof Error ? upstream.error.message : String(upstream.error))
   }
 
-  console.log(`[cmdc-proxy] ${upstream.status} chat model=${model} stream=${wantsStream}`)
+  stats.status = upstream.status
   if (!upstream.ok) {
     const text = await upstream.text()
     const parsed = parseJson(text)
@@ -213,6 +512,8 @@ async function proxyChat(request, response) {
         parsed?.message ??
         text) ||
       `Command Code request failed (${upstream.status})`
+    stats.error = message
+    logRequest(stats)
     json(response, upstream.status, {
       error: {
         type: parsed?.error?.type ?? "upstream_error",
@@ -229,15 +530,42 @@ async function proxyChat(request, response) {
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    await streamOpenAI(upstream, response, {
-      model,
-      includeUsage: input.stream_options?.include_usage === true,
-      toolRegistry: converted.toolRegistry,
-    })
+    try {
+      const result = await streamOpenAI(upstream, response, {
+        model,
+        includeUsage: input.stream_options?.include_usage === true,
+        toolRegistry: converted.toolRegistry,
+        stats,
+      })
+      stats.usage = result?.usage
+      stats.error = result?.error
+      logRequest(stats)
+      if (!result?.finished || result?.error) {
+        logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
+        rotateThreadId(clientThreadId)
+      }
+    } catch (error) {
+      logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
+      rotateThreadId(clientThreadId)
+      stats.error = error?.name === "AbortError" ? "aborted" : error instanceof Error ? error.message : String(error)
+      logRequest(stats)
+      if (error?.name !== "AbortError") throw error
+    }
     return
   }
 
-  json(response, 200, await collectOpenAI(upstream, model, converted.toolRegistry))
+  try {
+    const result = await collectOpenAI(upstream, model, converted.toolRegistry, stats)
+    stats.usage = result.usage
+    logRequest(stats)
+    json(response, 200, result)
+  } catch (error) {
+    logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
+    rotateThreadId(clientThreadId)
+    stats.error = error instanceof Error ? error.message : String(error)
+    logRequest(stats)
+    throw error
+  }
 }
 
 async function proxyAnthropic(request, response) {
@@ -287,26 +615,50 @@ async function proxyResponses(request, response) {
 }
 
 async function runCommandCode(request, response, input, protocol, model, wantsStream, toolRegistry, requestInput) {
-  const threadId = threadIdFrom(request.headers, requestInput)
+  const clientThreadId = threadIdFrom(request.headers, requestInput)
+  const threadId = resolveThreadId(clientThreadId)
+  const stats = createRequestStats(protocol, model, wantsStream)
+  const debug = createDebugLog(protocol, request)
+  stats.debug = debug
+  if (debug) response.on("close", () => setImmediate(() => finishDebug(debug, stats)))
   const controller = new AbortController()
   response.on("close", () => controller.abort())
+  const headers = buildHeaders(threadId)
+  const upstreamBody = buildGenerateBody(input, threadId)
+  const context = applyContextGuard(upstreamBody)
+  debug?.write("client_request", { protocol, headers: redactedHeaders(request.headers), body: requestInput })
+  debug?.write("upstream_request", { threadId, headers: redactedHeaders(headers), body: upstreamBody, context })
 
   const upstream = await fetch(`${BASE_URL}/alpha/generate`, {
     method: "POST",
-    headers: buildHeaders(threadId),
-    body: JSON.stringify(buildGenerateBody(input, threadId)),
+    headers,
+    body: JSON.stringify(upstreamBody),
     signal: controller.signal,
-  }).catch((error) => ({ error }))
+  }).catch((error) => {
+    debug?.write("fetch_error", { message: error instanceof Error ? error.message : String(error) })
+    return { error }
+  })
+
+  if (!("error" in upstream)) {
+    debug?.write("upstream_response", {
+      status: upstream.status,
+      headers: redactedHeaders(Object.fromEntries(upstream.headers)),
+    })
+  }
 
   if ("error" in upstream) {
     if (upstream.error?.name === "AbortError") {
+      stats.error = "aborted"
+      logRequest(stats)
       response.end()
       return
     }
+    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
+    logRequest(stats)
     throw new HttpError(502, upstream.error instanceof Error ? upstream.error.message : String(upstream.error))
   }
 
-  console.log(`[cmdc-proxy] ${upstream.status} ${protocol} model=${model} stream=${wantsStream}`)
+  stats.status = upstream.status
   if (!upstream.ok) {
     const text = await upstream.text()
     const parsed = parseJson(text)
@@ -315,6 +667,8 @@ async function runCommandCode(request, response, input, protocol, model, wantsSt
         parsed?.message ??
         text) ||
       "Command Code returned an error"
+    stats.error = message
+    logRequest(stats)
     if (protocol === "anthropic") {
       json(response, upstream.status, { type: "error", error: { type: "proxy_error", message } })
     } else {
@@ -329,15 +683,176 @@ async function runCommandCode(request, response, input, protocol, model, wantsSt
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    if (protocol === "anthropic") await streamAnthropic(upstream, response, model, toolRegistry)
-    else await streamResponses(upstream, response, model, toolRegistry)
+    try {
+      const result =
+        protocol === "anthropic"
+          ? await streamAnthropic(upstream, response, model, toolRegistry, stats)
+          : await streamResponses(upstream, response, model, toolRegistry, stats)
+      stats.usage = result?.usage
+      stats.error = result?.error
+      logRequest(stats)
+      if (!result?.finished || result?.error) {
+        logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
+        rotateThreadId(clientThreadId)
+      }
+    } catch (error) {
+      logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
+      rotateThreadId(clientThreadId)
+      stats.error = error?.name === "AbortError" ? "aborted" : error instanceof Error ? error.message : String(error)
+      logRequest(stats)
+      if (error?.name !== "AbortError") throw error
+    }
     return
   }
 
-  const result = await collectCommandCode(upstream)
-  if (result.error) throw new HttpError(errorStatus(result.error), result.error)
-  if (protocol === "anthropic") json(response, 200, commandCodeToAnthropic(result, model, toolRegistry))
-  else json(response, 200, commandCodeToResponses(result, model, toolRegistry))
+  try {
+    const result = await collectCommandCode(upstream, stats)
+    if (result.error) {
+      stats.error = result.error
+      logRequest(stats)
+      throw new HttpError(errorStatus(result.error), result.error)
+    }
+    stats.usage = result.usage
+    logRequest(stats)
+    if (protocol === "anthropic") json(response, 200, commandCodeToAnthropic(result, model, toolRegistry))
+    else json(response, 200, commandCodeToResponses(result, model, toolRegistry))
+  } catch (error) {
+    logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
+    rotateThreadId(clientThreadId)
+    if (!stats.error) {
+      stats.error = error instanceof Error ? error.message : String(error)
+      logRequest(stats)
+    }
+    throw error
+  }
+}
+
+function repairToolCallHistory(messages) {
+  const repaired = []
+  const pending = new Map()
+  let synthesized = 0
+  let dropped = 0
+  let mergedUsers = 0
+
+  const pushMessage = (message) => {
+    const last = repaired[repaired.length - 1]
+    if (message.role === "user" && last?.role === "user") {
+      last.content = [...(Array.isArray(last.content) ? last.content : []), ...(message.content ?? [])]
+      mergedUsers += 1
+      return
+    }
+    repaired.push(message)
+  }
+
+  const flushPending = () => {
+    for (const [id, name] of pending) {
+      pushMessage({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: id,
+            toolName: name,
+            output: { type: "text", value: "Tool execution was interrupted before a result was returned." },
+          },
+        ],
+      })
+      synthesized += 1
+    }
+    pending.clear()
+  }
+
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue
+    if (message.role === "assistant") {
+      flushPending()
+      for (const block of Array.isArray(message.content) ? message.content : []) {
+        if (block?.type !== "tool-call") continue
+        const id = block.toolCallId || `call_${randomID()}`
+        block.toolCallId = id
+        pending.set(id, block.toolName || "unknown")
+      }
+      pushMessage(message)
+      continue
+    }
+    if (message.role === "tool") {
+      const matched = []
+      for (const block of Array.isArray(message.content) ? message.content : []) {
+        if (block?.type !== "tool-result" || !block.toolCallId || !pending.has(block.toolCallId)) {
+          dropped += 1
+          continue
+        }
+        pending.delete(block.toolCallId)
+        matched.push(block)
+      }
+      if (matched.length > 0) pushMessage({ role: "tool", content: matched })
+      continue
+    }
+    flushPending()
+    pushMessage(message)
+  }
+  flushPending()
+
+  if (synthesized || dropped || mergedUsers) {
+    logWarn(`repaired tool history: synthesized=${synthesized} dropped=${dropped} merged_users=${mergedUsers}`)
+  }
+  return repaired
+}
+
+function stripHistoricalImages(messages) {
+  let lastUserIndex = -1
+  for (const [index, message] of messages.entries()) {
+    if (message?.role === "user") lastUserIndex = index
+  }
+
+  let removed = 0
+  let removedChars = 0
+  for (const [index, message] of messages.entries()) {
+    if (index === lastUserIndex || !Array.isArray(message?.content)) continue
+    message.content = message.content.map((block) => {
+      if (block?.type !== "image") return block
+      removed += 1
+      removedChars += JSON.stringify(block).length
+      return { type: "text", text: "[image omitted from earlier history]" }
+    })
+  }
+  return { removed, removedChars }
+}
+
+function applyContextGuard(body) {
+  const before = Buffer.byteLength(JSON.stringify(body))
+  if (CONTEXT_MODE === "passthrough") return { before, after: before, removed: 0, removedChars: 0 }
+  if (CONTEXT_MODE === "error" && before > MAX_REQUEST_BYTES) {
+    throw new HttpError(
+      400,
+      `Request is ${before} bytes, above CMDC_MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES}); compact the conversation and retry.`,
+      "context_length_exceeded",
+    )
+  }
+
+  const shouldStrip =
+    CONTEXT_MODE === "strip-images" || (CONTEXT_MODE === "auto" && before > MAX_REQUEST_BYTES)
+  const stripped = shouldStrip && Array.isArray(body?.params?.messages)
+    ? stripHistoricalImages(body.params.messages)
+    : { removed: 0, removedChars: 0 }
+  const after = Buffer.byteLength(JSON.stringify(body))
+
+  if (after > HARD_REQUEST_BYTES) {
+    throw new HttpError(
+      400,
+      `Request is still ${after} bytes after context guard (hard limit ${HARD_REQUEST_BYTES}); compact the conversation and retry.`,
+      "context_length_exceeded",
+    )
+  }
+  if (stripped.removed > 0) {
+    logWarn(
+      `context guard: ${before} -> ${after} bytes, stripped ${stripped.removed} historical image(s), ~${stripped.removedChars} chars`,
+    )
+    logWarn("context guard: rewriting historical images can invalidate the upstream prompt cache")
+  } else if (before > MAX_REQUEST_BYTES) {
+    logWarn(`context guard: request is ${before} bytes and no historical images were removed`)
+  }
+  return { before, after, ...stripped }
 }
 
 function anthropicToCommandCode(input) {
@@ -374,7 +889,11 @@ function anthropicToCommandCode(input) {
           })
         }
       }
-      if (content.length > 0) messages.push({ role: "assistant", content })
+      messages.push(
+        content.length > 0
+          ? { role: "assistant", content }
+          : { role: "assistant", content: [{ type: "text", text: "(previous assistant response was empty)" }] },
+      )
       continue
     }
 
@@ -436,7 +955,7 @@ function anthropicToCommandCode(input) {
   return {
     model: input.model,
     system,
-    messages,
+    messages: repairToolCallHistory(messages),
     tools,
     maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.min(64000, Math.floor(maxTokens)) : 64000,
     temperature: typeof input.temperature === "number" ? input.temperature : undefined,
@@ -507,7 +1026,11 @@ function responsesToCommandCode(input) {
       if (role === "assistant") {
         const reasoning = takeReasoning()
         const parts = reasoning ? [reasoning, ...content] : content
-        if (parts.length > 0) messages.push({ role: "assistant", content: parts })
+        messages.push(
+          parts.length > 0
+            ? { role: "assistant", content: parts }
+            : { role: "assistant", content: [{ type: "text", text: "(previous assistant response was empty)" }] },
+        )
         continue
       }
       const reasoning = takeReasoning()
@@ -622,7 +1145,7 @@ function responsesToCommandCode(input) {
   return {
     model: input.model,
     system,
-    messages,
+    messages: repairToolCallHistory(messages),
     tools,
     maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.min(64000, Math.floor(maxTokens)) : 64000,
     temperature: typeof input.temperature === "number" ? input.temperature : undefined,
@@ -1047,7 +1570,11 @@ function openAIToCommandCode(input) {
           input: parseToolArguments(call.function?.arguments),
         })
       }
-      if (content.length > 0) messages.push({ role: "assistant", content })
+      messages.push(
+        content.length > 0
+          ? { role: "assistant", content }
+          : { role: "assistant", content: [{ type: "text", text: "(previous assistant response was empty)" }] },
+      )
       continue
     }
     if (message.role === "tool") {
@@ -1115,7 +1642,7 @@ function openAIToCommandCode(input) {
   return {
     model: input.model,
     system,
-    messages,
+    messages: repairToolCallHistory(messages),
     tools,
     maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.min(64000, Math.floor(maxTokens)) : 64000,
     temperature: typeof input.temperature === "number" ? input.temperature : undefined,
@@ -1278,6 +1805,8 @@ async function streamOpenAI(upstream, response, options) {
   const created = Math.floor(Date.now() / 1000)
   let toolIndex = 0
   let finished = false
+  let usage
+  let error
 
   const write = (value) => {
     if (response.writableEnded || response.destroyed) return
@@ -1295,14 +1824,17 @@ async function streamOpenAI(upstream, response, options) {
   const result = await readCommandCode(upstream, (event) => {
     if (finished) return
     if (event.type === "text") {
+      markOutput(options.stats)
       write(chunk({ content: event.text }, null))
       return
     }
     if (event.type === "reasoning") {
+      markOutput(options.stats)
       write(chunk({ reasoning_content: event.text }, null))
       return
     }
     if (event.type === "tool") {
+      markOutput(options.stats)
       const name = options.toolRegistry?.byName.get(event.name)?.name ?? event.name
       write(
         chunk(
@@ -1326,6 +1858,7 @@ async function streamOpenAI(upstream, response, options) {
     }
     if (event.type === "finish") {
       finished = true
+      usage = event.usage
       write(chunk({}, event.reason))
       if (options.includeUsage) {
         write({
@@ -1342,24 +1875,22 @@ async function streamOpenAI(upstream, response, options) {
     }
     if (event.type === "error") {
       finished = true
-      write({ error: { message: event.message, type: "upstream_error" } })
-      response.write("data: [DONE]\n\n")
+      error = event.message
+      return
     }
-  })
+  }, options.stats?.debug)
 
-  if (!finished) {
-    write({
-      error: {
-        message: result.error ?? "Command Code stream ended before completion",
-        type: "upstream_error",
-      },
-    })
+  const completed = finished && !error
+  if (!completed) {
+    error ??= result.error ?? result.readError ?? "Command Code stream ended before completion"
+    write(chunk({}, "stop"))
     response.write("data: [DONE]\n\n")
   }
   response.end()
+  return { usage, error, finished: completed }
 }
 
-async function collectCommandCode(upstream) {
+async function collectCommandCode(upstream, stats) {
   const result = {
     created: Math.floor(Date.now() / 1000),
     text: "",
@@ -1374,6 +1905,7 @@ async function collectCommandCode(upstream) {
   let lastBlock
   await readCommandCode(upstream, (event) => {
     if (event.type === "text") {
+      markOutput(stats)
       if (lastBlock?.type !== "text") {
         lastBlock = { type: "text", text: "" }
         result.blocks.push(lastBlock)
@@ -1382,6 +1914,7 @@ async function collectCommandCode(upstream) {
       result.text += event.text
     }
     if (event.type === "reasoning") {
+      markOutput(stats)
       if (lastBlock?.type !== "reasoning") {
         lastBlock = { type: "reasoning", text: "" }
         result.blocks.push(lastBlock)
@@ -1390,6 +1923,7 @@ async function collectCommandCode(upstream) {
       result.reasoning += event.text
     }
     if (event.type === "tool") {
+      markOutput(stats)
       lastBlock = { type: "tool", tool: event }
       result.blocks.push(lastBlock)
       result.tools.push(event)
@@ -1399,15 +1933,15 @@ async function collectCommandCode(upstream) {
       result.usage = event.usage
     }
     if (event.type === "error") result.error = event.message
-  })
+  }, stats?.debug)
 
   if (result.error) throw new HttpError(errorStatus(result.error), result.error)
   if (result.finish === undefined) throw new HttpError(502, "Command Code stream ended before completion")
   return result
 }
 
-async function collectOpenAI(upstream, model, toolRegistry) {
-  const result = await collectCommandCode(upstream)
+async function collectOpenAI(upstream, model, toolRegistry, stats) {
+  const result = await collectCommandCode(upstream, stats)
   const message = {
     role: "assistant",
     content: result.text || (result.tools.length > 0 ? null : ""),
@@ -1582,7 +2116,7 @@ function responsesUsage(usage) {
   }
 }
 
-async function streamAnthropic(upstream, response, model, toolRegistry) {
+async function streamAnthropic(upstream, response, model, toolRegistry, stats) {
   const state = {
     id: `msg_${randomID()}`,
     model,
@@ -1650,15 +2184,17 @@ async function streamAnthropic(upstream, response, model, toolRegistry) {
   })
   emit("ping", {})
 
-  await readCommandCode(upstream, (event) => {
+  const readResult = await readCommandCode(upstream, (event) => {
     if (state.finish || state.failed) return
     if (event.type === "text") {
+      markOutput(stats)
       const block = ensureText()
       block.text += event.text
       emit("content_block_delta", { index: block.index, delta: { type: "text_delta", text: event.text } })
       return
     }
     if (event.type === "reasoning") {
+      markOutput(stats)
       const block = ensureReasoning()
       block.text += event.text
       emit("content_block_delta", {
@@ -1668,6 +2204,7 @@ async function streamAnthropic(upstream, response, model, toolRegistry) {
       return
     }
     if (event.type === "tool") {
+      markOutput(stats)
       const block = ensureTool(event)
       emit("content_block_delta", {
         index: block.index,
@@ -1686,17 +2223,14 @@ async function streamAnthropic(upstream, response, model, toolRegistry) {
       state.failed = true
       emit("error", { error: { type: "upstream_error", message: event.message } })
     }
-  })
+  }, stats?.debug)
 
   if (state.failed) {
     response.end()
-    return
+    return { usage: state.usage, error: state.failed, finished: false }
   }
-  if (!state.finish) {
-    emit("error", { error: { type: "upstream_error", message: "Command Code stream ended before completion" } })
-    response.end()
-    return
-  }
+  const truncated = !state.finish
+  if (truncated) state.finish = "stop"
 
   const blocks = [...state.blocks]
   blocks.sort((left, right) => left.index - right.index)
@@ -1722,9 +2256,14 @@ async function streamAnthropic(upstream, response, model, toolRegistry) {
   })
   emit("message_stop", {})
   response.end()
+  return {
+    usage: state.usage,
+    error: truncated ? (readResult.readError ?? "Command Code stream ended before completion") : undefined,
+    finished: !truncated,
+  }
 }
 
-async function streamResponses(upstream, response, model, toolRegistry) {
+async function streamResponses(upstream, response, model, toolRegistry, stats) {
   const state = {
     id: `resp_${randomID()}`,
     created: Math.floor(Date.now() / 1000),
@@ -1838,9 +2377,10 @@ async function streamResponses(upstream, response, model, toolRegistry) {
   emit("response.created", { response: responseObject("in_progress", []) })
   emit("response.in_progress", { response: responseObject("in_progress", []) })
 
-  await readCommandCode(upstream, (event) => {
+  const readResult = await readCommandCode(upstream, (event) => {
     if (state.finish || state.failed) return
     if (event.type === "text") {
+      markOutput(stats)
       const item = ensureText()
       item.text += event.text
       emit("response.output_text.delta", {
@@ -1852,6 +2392,7 @@ async function streamResponses(upstream, response, model, toolRegistry) {
       return
     }
     if (event.type === "reasoning") {
+      markOutput(stats)
       const item = ensureReasoning()
       item.text += event.text
       emit("response.reasoning_summary_text.delta", {
@@ -1863,6 +2404,7 @@ async function streamResponses(upstream, response, model, toolRegistry) {
       return
     }
     if (event.type === "tool") {
+      markOutput(stats)
       ensureTool(event)
       state.text = undefined
       state.reasoning = undefined
@@ -1877,17 +2419,14 @@ async function streamResponses(upstream, response, model, toolRegistry) {
       state.failed = true
       emit("error", { error: { type: "upstream_error", message: event.message } })
     }
-  })
+  }, stats?.debug)
 
   if (state.failed) {
     response.end()
-    return
+    return { usage: state.usage, error: state.failed, finished: false }
   }
-  if (!state.finish) {
-    emit("error", { error: { type: "upstream_error", message: "Command Code stream ended before completion" } })
-    response.end()
-    return
-  }
+  const truncated = !state.finish
+  if (truncated) state.finish = "stop"
 
   const items = state.blocks.map((block) => {
     if (block.kind === "reasoning") {
@@ -1976,15 +2515,27 @@ async function streamResponses(upstream, response, model, toolRegistry) {
   const terminal = status === "incomplete" ? "response.incomplete" : "response.completed"
   emit(terminal, { response: responseObject(status, items.map((item) => item.item)) })
   response.end()
+  return {
+    usage: state.usage,
+    error: truncated ? (readResult.readError ?? "Command Code stream ended before completion") : undefined,
+    finished: !truncated,
+  }
 }
 
-async function readCommandCode(upstream, onEvent) {
+async function readCommandCode(upstream, onEvent, debug) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
+  const debugStartedAt = Date.now()
   let buffer = ""
   let finished = false
   let error
+  let readFailure
   let lastFinish
+  let rawBytes = 0
+  let lineCount = 0
+  let parsedEvents = 0
+  let unparsedLines = 0
+  const eventTypes = new Map()
   const textFilter = new ControlTextFilter()
   const reasoningFilter = new ControlTextFilter()
 
@@ -2001,9 +2552,25 @@ async function readCommandCode(upstream, onEvent) {
   }
 
   const consume = (line) => {
-    if (!line.trim()) return
+    if (!line.trim()) {
+      debug?.write("upstream_blank_line", { offsetMs: Date.now() - debugStartedAt })
+      return
+    }
+    lineCount += 1
     const event = parseJson(line)
-    if (!event) return
+    debug?.write("upstream_line", {
+      offsetMs: Date.now() - debugStartedAt,
+      bytes: Buffer.byteLength(line) + 1,
+      parsedType: event?.type ?? null,
+      line: line.slice(0, 1_000_000),
+    })
+    if (!event) {
+      unparsedLines += 1
+      return
+    }
+    parsedEvents += 1
+    const eventType = String(event.type ?? "unknown")
+    eventTypes.set(eventType, (eventTypes.get(eventType) ?? 0) + 1)
     if (
       event.type === "text-start" ||
       event.type === "text-end" ||
@@ -2065,26 +2632,51 @@ async function readCommandCode(upstream, onEvent) {
     }
   }
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let newline = buffer.indexOf("\n")
-    while (newline !== -1) {
-      consume(buffer.slice(0, newline))
-      buffer = buffer.slice(newline + 1)
-      newline = buffer.indexOf("\n")
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      rawBytes += value.byteLength
+      debug?.write("upstream_chunk", { offsetMs: Date.now() - debugStartedAt, bytes: value.byteLength })
+      buffer += decoder.decode(value, { stream: true })
+      let newline = buffer.indexOf("\n")
+      while (newline !== -1) {
+        consume(buffer.slice(0, newline))
+        buffer = buffer.slice(newline + 1)
+        newline = buffer.indexOf("\n")
+      }
     }
+    buffer += decoder.decode()
+    if (buffer.trim()) consume(buffer)
+  } catch (caught) {
+    if (caught?.name === "AbortError") throw caught
+    readFailure = caught instanceof Error ? caught.message : String(caught)
   }
-  buffer += decoder.decode()
-  if (buffer.trim()) consume(buffer)
   if (!finished) flushFilters()
   if (!finished && lastFinish) {
     finished = true
     onEvent({ type: "finish", reason: lastFinish.reason, usage: lastFinish.usage })
   }
 
-  return { finished, error }
+  if (!finished || error || readFailure) {
+    const types = [...eventTypes].map(([type, count]) => `${type}:${count}`).join(",") || "none"
+    logWarn(
+      `upstream stream incomplete: bytes=${rawBytes} lines=${lineCount} events=${parsedEvents} unparsed=${unparsedLines} types=${types}${readFailure ? ` read_error=${readFailure}` : ""}`,
+    )
+  }
+
+  debug?.write("upstream_end", {
+    offsetMs: Date.now() - debugStartedAt,
+    finished,
+    error: error ?? null,
+    readFailure: readFailure ?? null,
+    bytes: rawBytes,
+    lines: lineCount,
+    events: parsedEvents,
+    unparsed: unparsedLines,
+    types: Object.fromEntries(eventTypes),
+  })
+  return { finished, error, readError: readFailure }
 }
 
 function normalizeFinishReason(reason) {

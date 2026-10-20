@@ -34,6 +34,10 @@ node cmdc-proxy.mjs
 
 The default endpoint is `http://127.0.0.1:8787/v1`.
 
+If the preferred port is in use, the proxy automatically tries the next ports (up to `PORT_ATTEMPTS`) and prints the actual listening address at startup.
+
+Each request log includes a timestamp, status, model, stream mode, input/output/total tokens, cached and reasoning tokens, total elapsed time, first-token latency (TTFT), the observed generation window, and output tokens per second measured over that window.
+
 ### Client settings
 
 | Setting | Value |
@@ -106,7 +110,10 @@ print(response.output_text)
 - Adds the Command Code CLI request headers.
 - Translates Command Code's newline-delimited event stream into the client protocol.
 - Supports streaming and non-streaming requests, function tools, Codex custom tools, namespaced tools, reasoning content, and usage.
-- Replays assistant reasoning on later turns and keeps a stable upstream thread per client conversation.
+- Replays assistant reasoning on later turns and keeps a stable upstream thread per client conversation. If a stream ends before completion, the proxy closes it with a valid terminal event and rotates the upstream thread so the next turn can continue.
+- Repairs incomplete tool-call history before forwarding: missing tool results are filled with an interrupted-result marker, orphan results are dropped, and consecutive user messages are merged.
+- Preserves empty assistant turns with a short placeholder so repeated empty responses do not collapse the conversation into one oversized user message.
+- Enforces an upstream transport size guard. By default, oversized requests are rejected with `context_length_exceeded`; history is never rewritten.
 
 ### Codex / Responses tools
 
@@ -181,6 +188,8 @@ This keeps clients such as Cherry Studio working when reasoning is disabled.
 | --- | --- | --- |
 | `PORT` | `8787` | Listen port |
 | `HOST` | `127.0.0.1` | Listen host |
+| `PORT_ATTEMPTS` | `20` | Try up to this many consecutive ports when the preferred port is in use |
+| `LOG_TIME_ZONE` | `Asia/Hong_Kong` | Time zone used for log timestamps |
 | `CMDC_BASE_URL` | `https://api.commandcode.ai` | Upstream base URL |
 | `CMDC_AUTH_PATH` | `~/.commandcode/auth.json` | Command Code login file |
 | `COMMAND_CODE_API_KEY` | unset | Override the login key |
@@ -195,6 +204,26 @@ This keeps clients such as Cherry Studio working when reasoning is disabled.
 | `CMDC_PERMISSION_MODE` | `standard` | Command Code permission mode (`standard`, `plan`, `auto-accept`; `bypass` maps to `auto-accept`) |
 | `CMDC_MODE` | `agent` | Upstream generate mode (`agent`, `learning`, `custom-agent`, `custom-agent-create`, `title-gen`, `tool-desc`, `compact`, `vision`) |
 | `CMDC_ZDR` | unset | Set to `1` to send `x-cmd-zdr` |
+| `CMDC_DEBUG` | unset | Set to `1` to write per-request JSONL diagnostics |
+| `CMDC_DEBUG_DIR` | `<workdir>/.cmdc-debug` | Debug log directory; setting this variable also enables debug mode |
+| `CMDC_CONTEXT_MODE` | `error` | `error` rejects oversized requests without changing history; `auto` trims old images above the size limit; `passthrough` disables the guard; `strip-images` always trims |
+| `CMDC_MAX_REQUEST_BYTES` | `8388608` | Soft size threshold used by `auto` and `error` modes |
+| `CMDC_HARD_REQUEST_BYTES` | `12582912` | Hard limit; larger requests are rejected with `context_length_exceeded` |
+
+## Debugging
+
+Enable debug mode before starting the proxy:
+
+```powershell
+$env:CMDC_DEBUG = "1"
+npm start
+```
+
+Each request writes one JSONL file under `.cmdc-debug/` containing the client request, the converted upstream request, redacted request headers, upstream response status and headers, every raw upstream line with its timing, and the final usage/error result. The log path is printed as `debug log: ...`.
+
+Set the `x-cmdc-debug: 1` request header to debug a single request without restarting the proxy. Authorization and API-key headers are redacted, but prompts, tool output, and model output are stored verbatim, so review debug logs before sharing them.
+
+Conversation compaction remains the harness's responsibility. The default `error` mode never rewrites history, so it preserves upstream prompt-cache prefixes: the harness compacts at a deliberate boundary and subsequent append-only requests can reuse the cache. `auto` and `strip-images` are compatibility escape hatches; removing images from the middle of history invalidates the cache from the first changed image onward.
 
 ## Limitations
 
