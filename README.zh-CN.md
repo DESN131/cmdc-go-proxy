@@ -105,7 +105,18 @@ print(response.output_text)
 - 请求 `https://api.commandcode.ai/alpha/generate`。
 - 自动添加 Command Code CLI 所需的请求头。
 - 将 Command Code 的逐行事件流转换为客户端协议。
-- 支持流式、非流式、工具调用、推理内容和 usage。
+- 支持流式、非流式、函数工具、Codex 自定义工具、命名空间工具、推理内容和 usage。
+- 在后续轮次回放助手推理，并为同一客户端会话保持稳定的上游线程。
+
+### Codex / Responses 工具
+
+Codex 会把 `apply_patch` 作为自由格式的 `custom` 工具发送，并把 MCP 工具放在 `namespace` 工具中。代理会先把它们展开为普通的函数工具发给上游，再把上游返回的调用还原为 `custom_tool_call` 或带命名空间的 `function_call`。这是 Codex 通过代理编辑文件和调用 MCP 工具所必需的。
+
+Responses 的 reasoning 项会被保留。代理用一种紧凑的本地编码写入 `encrypted_content`，以便下一轮回放相同的推理文本；其他来源的不可读 reasoning 会以空推理块回放。
+
+### 思考指令
+
+最新用户消息开头的 `/think` 和 `/no_think` 会在转发前移除，并转换为推理强度。流式输出开头出现的同类控制标记也会被移除，避免出现在客户端界面中。
 
 ## 端点
 
@@ -150,6 +161,8 @@ gpt-6-luna
 
 模型目录会根据 `CMDC_PLAN` 过滤。
 
+Codex 使用的模型别名（例如 `deepseek-flash`、`deepseek-v4-pro`）会自动解析为对应的 Command Code 模型 ID。
+
 ## 推理强度
 
 Command Code 接受 `off`、`low`、`medium`、`high`、`xhigh`、`max`。代理会在转发前归一化常见客户端值：
@@ -176,10 +189,11 @@ Command Code 接受 `off`、`low`、`medium`、`high`、`xhigh`、`max`。代理
 | `CMDC_WORKDIR` | 当前目录 | 发送给上游的工作目录 |
 | `CMDC_PROJECT_SLUG` | 由工作目录生成 | `x-project-slug` |
 | `CMDC_PLAN` | `individual-go` | 过滤 `/v1/models` |
-| `CMDC_THREAD_ID` | 自动生成 | 可选的固定上游线程 UUID |
+| `CMDC_THREAD_ID` | 自动生成 | 可选的固定上游线程 UUID；无效值会被忽略 |
 | `CMDC_SURFACE` | 未设置 | 可选的 `x-cli-surface` |
 | `CMDC_TASTE_LEARNING` | `false` | `x-taste-learning` |
-| `CMDC_PERMISSION_MODE` | `standard` | Command Code 权限模式 |
+| `CMDC_PERMISSION_MODE` | `standard` | Command Code 权限模式（`standard`、`plan`、`auto-accept`；`bypass` 映射为 `auto-accept`） |
+| `CMDC_MODE` | `agent` | 上游生成模式（`agent`、`learning`、`custom-agent`、`custom-agent-create`、`title-gen`、`tool-desc`、`compact`、`vision`） |
 | `CMDC_ZDR` | 未设置 | 设为 `1` 时发送 `x-cmd-zdr` |
 
 ## 限制
@@ -187,6 +201,8 @@ Command Code 接受 `off`、`low`、`medium`、`high`、`xhigh`、`max`。代理
 - 只实现 Chat Completions、Responses 和 Anthropic Messages。不暴露 embeddings、图片生成、音频和原生 provider 路由。
 - Responses 翻译不支持 `previous_response_id`、后台任务、托管工具和文件输入。
 - 工具选择通过 system 指令表达；`tool_choice: "none"` 会直接省略工具。
+- 支持函数工具、自定义工具和命名空间工具；`web_search` 等托管工具不会透传到上游。
+- 推理强度会根据 Command Code 模型目录中该模型支持的值自动收敛。
 - 套餐权限、额度、限流和计费由上游服务执行。
 - 这是非官方兼容层，Command Code CLI API 变化时可能需要更新。
 

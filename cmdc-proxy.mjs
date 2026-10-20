@@ -19,6 +19,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
+import zlib from "node:zlib"
 
 const PORT = Number(process.env.PORT ?? 8787)
 const HOST = process.env.HOST ?? "127.0.0.1"
@@ -30,9 +31,36 @@ const WORKDIR = process.env.CMDC_WORKDIR ?? process.cwd()
 const PROJECT_SLUG = process.env.CMDC_PROJECT_SLUG ?? slug(WORKDIR)
 const PLAN = process.env.CMDC_PLAN ?? "individual-go"
 const TASTE_LEARNING = process.env.CMDC_TASTE_LEARNING ?? "false"
-const PERMISSION_MODE = process.env.CMDC_PERMISSION_MODE ?? "standard"
-const DEFAULT_THREAD_ID = process.env.CMDC_THREAD_ID
+const PERMISSION_MODES = new Set(["standard", "plan", "auto-accept"])
+const PERMISSION_MODE =
+  process.env.CMDC_PERMISSION_MODE === "bypass"
+    ? "auto-accept"
+    : PERMISSION_MODES.has(process.env.CMDC_PERMISSION_MODE)
+      ? process.env.CMDC_PERMISSION_MODE
+      : "standard"
+const MODES = new Set([
+  "agent",
+  "learning",
+  "custom-agent",
+  "custom-agent-create",
+  "title-gen",
+  "tool-desc",
+  "compact",
+  "vision",
+])
+const MODE = MODES.has(process.env.CMDC_MODE) ? process.env.CMDC_MODE : "agent"
+const DEFAULT_THREAD_ID = isUuid(process.env.CMDC_THREAD_ID) ? process.env.CMDC_THREAD_ID : undefined
 const MAX_BODY_BYTES = 64 * 1024 * 1024
+const REASONING_PREFIX = "cmdc1:"
+
+const MODEL_ALIASES = {
+  "deepseek-flash": "deepseek/deepseek-v4.1-flash",
+  "deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash",
+  "deepseek-v4.1-flash-fast": "deepseek/deepseek-v4.1-flash-fast",
+  "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+  "deepseek-v4-flash-fast": "deepseek/deepseek-v4-flash-fast",
+  "deepseek-v4-pro": "deepseek/deepseek-v4-pro",
+}
 
 const PLAN_RANK = {
   "individual-go": 1,
@@ -147,20 +175,24 @@ async function handle(request, response) {
 async function proxyChat(request, response) {
   const input = parseBody(await readBody(request))
   if (!input) throw new HttpError(400, "Request body must be a JSON object")
-  if (typeof input.model !== "string" || input.model.length === 0) {
+  if (typeof input.model !== "string" || input.model.trim().length === 0) {
     throw new HttpError(400, "model is required")
+  }
+  if (!Array.isArray(input.messages)) {
+    throw new HttpError(400, "messages must be an array")
   }
 
   const wantsStream = input.stream === true
-  const model = normalizeModel(input.model)
-  const threadId = threadIdFrom(request.headers)
+  const model = await resolveModel(input.model)
+  const threadId = threadIdFrom(request.headers, input)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
+  const converted = openAIToCommandCode({ ...input, model })
 
   const upstream = await fetch(`${BASE_URL}/alpha/generate`, {
     method: "POST",
     headers: buildHeaders(threadId),
-    body: JSON.stringify(buildGenerateBody(openAIToCommandCode({ ...input, model }), threadId)),
+    body: JSON.stringify(buildGenerateBody(converted, threadId)),
     signal: controller.signal,
   }).catch((error) => ({ error }))
 
@@ -175,11 +207,19 @@ async function proxyChat(request, response) {
   console.log(`[cmdc-proxy] ${upstream.status} chat model=${model} stream=${wantsStream}`)
   if (!upstream.ok) {
     const text = await upstream.text()
-    response.writeHead(upstream.status, {
-      "content-type": upstream.headers.get("content-type") ?? "application/json",
-      "cache-control": "no-store",
+    const parsed = parseJson(text)
+    const message =
+      ((typeof parsed?.error === "string" ? parsed.error : parsed?.error?.message) ??
+        parsed?.message ??
+        text) ||
+      `Command Code request failed (${upstream.status})`
+    json(response, upstream.status, {
+      error: {
+        type: parsed?.error?.type ?? "upstream_error",
+        message,
+        ...(parsed?.error?.code ? { code: parsed.error.code } : {}),
+      },
     })
-    response.end(text)
     return
   }
 
@@ -192,43 +232,62 @@ async function proxyChat(request, response) {
     await streamOpenAI(upstream, response, {
       model,
       includeUsage: input.stream_options?.include_usage === true,
+      toolRegistry: converted.toolRegistry,
     })
     return
   }
 
-  json(response, 200, await collectOpenAI(upstream, model))
+  json(response, 200, await collectOpenAI(upstream, model, converted.toolRegistry))
 }
 
 async function proxyAnthropic(request, response) {
   const input = parseBody(await readBody(request))
   if (!input) throw new HttpError(400, "Request body must be a JSON object")
-  const model = normalizeModel(input.model)
+  if (typeof input.model !== "string" || input.model.trim().length === 0) {
+    throw new HttpError(400, "model is required")
+  }
+  if (!Array.isArray(input.messages)) {
+    throw new HttpError(400, "messages must be an array")
+  }
+  const model = await resolveModel(input.model)
+  const converted = anthropicToCommandCode({ ...input, model })
   await runCommandCode(
     request,
     response,
-    anthropicToCommandCode({ ...input, model }),
+    converted,
     "anthropic",
     model,
     input.stream === true,
+    converted.toolRegistry,
+    input,
   )
 }
 
 async function proxyResponses(request, response) {
   const input = parseBody(await readBody(request))
   if (!input) throw new HttpError(400, "Request body must be a JSON object")
-  const model = normalizeModel(input.model)
+  if (typeof input.model !== "string" || input.model.trim().length === 0) {
+    throw new HttpError(400, "model is required")
+  }
+  if (typeof input.input !== "string" && !Array.isArray(input.input)) {
+    throw new HttpError(400, "input must be a string or an array")
+  }
+  const model = await resolveModel(input.model)
+  const converted = responsesToCommandCode({ ...input, model })
   await runCommandCode(
     request,
     response,
-    responsesToCommandCode({ ...input, model }),
+    converted,
     "responses",
     model,
     input.stream === true,
+    converted.toolRegistry,
+    input,
   )
 }
 
-async function runCommandCode(request, response, input, protocol, model, wantsStream) {
-  const threadId = threadIdFrom(request.headers)
+async function runCommandCode(request, response, input, protocol, model, wantsStream, toolRegistry, requestInput) {
+  const threadId = threadIdFrom(request.headers, requestInput)
   const controller = new AbortController()
   response.on("close", () => controller.abort())
 
@@ -251,7 +310,11 @@ async function runCommandCode(request, response, input, protocol, model, wantsSt
   if (!upstream.ok) {
     const text = await upstream.text()
     const parsed = parseJson(text)
-    const message = parsed?.error?.message ?? text
+    const message =
+      ((typeof parsed?.error === "string" ? parsed.error : parsed?.error?.message) ??
+        parsed?.message ??
+        text) ||
+      "Command Code returned an error"
     if (protocol === "anthropic") {
       json(response, upstream.status, { type: "error", error: { type: "proxy_error", message } })
     } else {
@@ -266,35 +329,49 @@ async function runCommandCode(request, response, input, protocol, model, wantsSt
       "cache-control": "no-cache",
       connection: "keep-alive",
     })
-    if (protocol === "anthropic") await streamAnthropic(upstream, response, model)
-    else await streamResponses(upstream, response, model)
+    if (protocol === "anthropic") await streamAnthropic(upstream, response, model, toolRegistry)
+    else await streamResponses(upstream, response, model, toolRegistry)
     return
   }
 
   const result = await collectCommandCode(upstream)
   if (result.error) throw new HttpError(errorStatus(result.error), result.error)
-  if (protocol === "anthropic") json(response, 200, commandCodeToAnthropic(result, model))
-  else json(response, 200, commandCodeToResponses(result, model))
+  if (protocol === "anthropic") json(response, 200, commandCodeToAnthropic(result, model, toolRegistry))
+  else json(response, 200, commandCodeToResponses(result, model, toolRegistry))
 }
 
 function anthropicToCommandCode(input) {
   const system = []
-  const systemText = anthropicText(input.system)
+  let directiveEffort
+  const systemText = readThinkDirective(anthropicText(input.system), (effort) => (directiveEffort = effort))
   if (systemText) system.push({ type: "text", text: systemText })
   const messages = []
   const toolNames = new Map()
+  const toolRegistry = buildToolRegistry(input.tools)
+  const source = Array.isArray(input.messages) ? input.messages : []
+  const lastUserIndex = lastMessageIndex(source, "user")
 
-  for (const message of Array.isArray(input.messages) ? input.messages : []) {
+  for (const [messageIndex, message] of source.entries()) {
     if (!message || typeof message !== "object") continue
     if (message.role === "assistant") {
       const content = []
       for (const block of anthropicBlocks(message.content)) {
         if (block.type === "text" && typeof block.text === "string") content.push({ type: "text", text: block.text })
+        if (block.type === "thinking" && typeof block.thinking === "string") {
+          content.push({ type: "reasoning", text: stripThinkControl(block.thinking) })
+        }
+        if (block.type === "redacted_thinking") content.push({ type: "reasoning", text: "" })
         if (block.type === "tool_use") {
           const id = block.id ?? `call_${randomID()}`
           const name = block.name ?? ""
-          toolNames.set(id, name)
-          content.push({ type: "tool-call", toolCallId: id, toolName: name, input: block.input ?? {} })
+          const upstreamName = resolveToolName(toolRegistry, name) || "unknown"
+          toolNames.set(id, upstreamName)
+          content.push({
+            type: "tool-call",
+            toolCallId: id,
+            toolName: upstreamName,
+            input: parseToolArguments(block.input),
+          })
         }
       }
       if (content.length > 0) messages.push({ role: "assistant", content })
@@ -302,6 +379,7 @@ function anthropicToCommandCode(input) {
     }
 
     const parts = []
+    let directiveApplied = false
     const flush = () => {
       if (parts.length === 0) return
       messages.push({ role: "user", content: parts.splice(0) })
@@ -323,7 +401,12 @@ function anthropicToCommandCode(input) {
         continue
       }
       if (block.type === "text" && typeof block.text === "string") {
-        parts.push({ type: "text", text: block.text })
+        const text =
+          messageIndex === lastUserIndex && !directiveApplied
+            ? readThinkDirective(block.text, (effort) => (directiveEffort = effort))
+            : block.text
+        directiveApplied = true
+        if (text) parts.push({ type: "text", text })
         continue
       }
       if (block.type === "image") {
@@ -336,23 +419,22 @@ function anthropicToCommandCode(input) {
 
   if (system.length === 0) system.push({ type: "text", text: "You are a helpful assistant." })
 
-  let tools = (Array.isArray(input.tools) ? input.tools : []).map((tool) => ({
-    name: tool.name,
-    description: tool.description ?? "",
-    input_schema: tool.input_schema ?? { type: "object", properties: {} },
-  }))
+  let tools = toolRegistry.tools
 
   const choice = input.tool_choice
   if (choice?.type === "none") tools = []
   else if (choice?.type === "any") {
     system.push({ type: "text", text: "You must call one of the provided tools for this request." })
   } else if (choice?.type === "tool" && choice.name) {
-    system.push({ type: "text", text: `You must call the tool "${choice.name}" for this request.` })
+    system.push({
+      type: "text",
+      text: `You must call the tool "${resolveToolName(toolRegistry, choice.name)}" for this request.`,
+    })
   }
 
   const maxTokens = Number(input.max_tokens)
   return {
-    model: normalizeModel(input.model),
+    model: input.model,
     system,
     messages,
     tools,
@@ -361,7 +443,9 @@ function anthropicToCommandCode(input) {
     topP: typeof input.top_p === "number" ? input.top_p : undefined,
     stop: input.stop_sequences,
     reasoningEffort:
-      input.thinking?.type === "enabled" ? "high" : input.thinking?.type === "disabled" ? "off" : undefined,
+      directiveEffort ??
+      (input.thinking?.type === "enabled" ? "high" : input.thinking?.type === "disabled" ? "off" : undefined),
+    toolRegistry,
   }
 }
 
@@ -371,85 +455,465 @@ function responsesToCommandCode(input) {
     system.push({ type: "text", text: input.instructions })
   }
   const messages = []
+  const toolRegistry = buildToolRegistry(input.tools)
+  const callNames = new Map()
+  const source =
+    typeof input.input === "string"
+      ? [{ type: "message", role: "user", content: input.input }]
+      : Array.isArray(input.input)
+        ? input.input
+        : []
+  const lastUserIndex = lastMessageIndex(source, "user")
+  let pendingReasoning = ""
+  let pendingReasoningSeen = false
+  let directiveEffort
 
-  if (typeof input.input === "string") {
-    messages.push({ role: "user", content: [{ type: "text", text: input.input }] })
-  } else if (Array.isArray(input.input)) {
-    for (const item of input.input) {
-      if (typeof item === "string") {
-        messages.push({ role: "user", content: [{ type: "text", text: item }] })
+  const takeReasoning = () => {
+    if (!pendingReasoningSeen) return undefined
+    const reasoning = { type: "reasoning", text: pendingReasoning }
+    pendingReasoning = ""
+    pendingReasoningSeen = false
+    return reasoning
+  }
+
+  for (const [itemIndex, item] of source.entries()) {
+    if (typeof item === "string") {
+      const text = itemIndex === lastUserIndex ? readThinkDirective(item, (effort) => (directiveEffort = effort)) : item
+      if (text) messages.push({ role: "user", content: [{ type: "text", text }] })
+      continue
+    }
+    if (!item || typeof item !== "object") continue
+
+    if (item.type === "reasoning") {
+      pendingReasoning += stripThinkControl(decodeReasoning(item.encrypted_content) ?? reasoningTextFromItem(item))
+      pendingReasoningSeen = true
+      continue
+    }
+
+    if (item.type === "message") {
+      const role = item.role ?? "user"
+      const content = responsesContentToCommandCode(item.content)
+      if (role === "system" || role === "developer") {
+        system.push(
+          ...content.flatMap((part, index) => {
+            if (part.type !== "text") return [part]
+            const text =
+              index === 0 ? readThinkDirective(part.text, (effort) => (directiveEffort = effort)) : part.text
+            return text ? [{ ...part, text }] : []
+          }),
+        )
         continue
       }
-      if (!item || typeof item !== "object") continue
-      if (item.type === "message") {
-        const content = responsesContentToCommandCode(item.content)
-        if (content.length > 0) messages.push({ role: item.role ?? "user", content })
+      if (role === "assistant") {
+        const reasoning = takeReasoning()
+        const parts = reasoning ? [reasoning, ...content] : content
+        if (parts.length > 0) messages.push({ role: "assistant", content: parts })
         continue
       }
-      if (item.type === "function_call") {
-        messages.push({
-          role: "assistant",
-          content: [
-            {
-              type: "tool-call",
-              toolCallId: item.call_id ?? item.id ?? `call_${randomID()}`,
-              toolName: item.name ?? "",
-              input: parseJson(item.arguments) ?? {},
-            },
-          ],
-        })
+      const reasoning = takeReasoning()
+      if (reasoning) messages.push({ role: "assistant", content: [reasoning] })
+      if (itemIndex === lastUserIndex) {
+        const parts = stripThinkFromParts(content, (effort) => (directiveEffort = effort))
+        if (parts.length > 0) messages.push({ role: "user", content: parts })
         continue
       }
-      if (item.type === "function_call_output") {
-        messages.push({
-          role: "tool",
-          content: [
-            {
-              type: "tool-result",
-              toolCallId: item.call_id ?? "",
-              toolName: "unknown",
-              output: {
-                type: "text",
-                value: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
-              },
-            },
-          ],
-        })
-      }
+      if (content.length > 0) messages.push({ role: "user", content })
+      continue
+    }
+
+    if (item.type === "function_call") {
+      const id = item.call_id ?? item.id ?? `call_${randomID()}`
+      const toolName = resolveToolName(toolRegistry, item.name ?? "", item.namespace) || "unknown"
+      callNames.set(id, toolName)
+      const reasoning = takeReasoning()
+      messages.push({
+        role: "assistant",
+        content: [
+          ...(reasoning ? [reasoning] : []),
+          {
+            type: "tool-call",
+            toolCallId: id,
+            toolName,
+            input: parseToolArguments(item.arguments),
+          },
+        ],
+      })
+      continue
+    }
+
+    if (item.type === "custom_tool_call") {
+      const id = item.call_id ?? item.id ?? `call_${randomID()}`
+      const toolName = resolveToolName(toolRegistry, item.name ?? "", item.namespace) || "unknown"
+      callNames.set(id, toolName)
+      const reasoning = takeReasoning()
+      messages.push({
+        role: "assistant",
+        content: [
+          ...(reasoning ? [reasoning] : []),
+          {
+            type: "tool-call",
+            toolCallId: id,
+            toolName,
+            input: { input: customToolInput(item.input) },
+          },
+        ],
+      })
+      continue
+    }
+
+    if (
+      item.type === "function_call_output" ||
+      item.type === "custom_tool_call_output" ||
+      item.type === "tool_result"
+    ) {
+      const id = item.call_id ?? item.tool_use_id ?? item.id ?? ""
+      messages.push({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: id,
+            toolName:
+              (callNames.get(id) ?? (item.name ? resolveToolName(toolRegistry, item.name, item.namespace) : "")) ||
+              "unknown",
+            output: { type: "text", value: outputText(item.output) },
+          },
+        ],
+      })
     }
   }
 
-  const systemMessages = messages.filter((message) => message.role === "system" || message.role === "developer")
-  for (const message of systemMessages) system.push(...message.content)
-  const chatMessages = messages.filter((message) => message.role !== "system" && message.role !== "developer")
+  const trailingReasoning = takeReasoning()
+  if (trailingReasoning) messages.push({ role: "assistant", content: [trailingReasoning] })
   if (system.length === 0) system.push({ type: "text", text: "You are a helpful assistant." })
 
-  let tools = (Array.isArray(input.tools) ? input.tools : [])
-    .filter((tool) => tool?.type === "function")
-    .map((tool) => ({
-      name: tool.name,
-      description: tool.description ?? "",
-      input_schema: tool.parameters ?? { type: "object", properties: {} },
-    }))
+  let tools = toolRegistry.tools
 
   const choice = input.tool_choice
   if (choice === "none") tools = []
   else if (choice === "required") {
     system.push({ type: "text", text: "You must call one of the provided tools for this request." })
-  } else if (choice && typeof choice === "object" && choice.type === "function" && choice.name) {
-    system.push({ type: "text", text: `You must call the tool "${choice.name}" for this request.` })
+  } else if (
+    choice &&
+    typeof choice === "object" &&
+    (choice.type === "function" || choice.type === "custom") &&
+    choice.name
+  ) {
+    system.push({
+      type: "text",
+      text: `You must call the tool "${resolveToolName(toolRegistry, choice.name, choice.namespace)}" for this request.`,
+    })
+  } else if (
+    choice &&
+    typeof choice === "object" &&
+    choice.type === "allowed_tools" &&
+    Array.isArray(choice.tools)
+  ) {
+    const allowed = new Set(
+      choice.tools.map((tool) => resolveToolName(toolRegistry, tool.name, tool.namespace)),
+    )
+    tools = tools.filter((tool) => allowed.has(tool.name))
+    if (choice.mode === "required") {
+      system.push({ type: "text", text: "You must call one of the provided tools for this request." })
+    }
   }
 
   const maxTokens = Number(input.max_output_tokens)
   return {
-    model: normalizeModel(input.model),
+    model: input.model,
     system,
-    messages: chatMessages,
+    messages,
     tools,
     maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.min(64000, Math.floor(maxTokens)) : 64000,
     temperature: typeof input.temperature === "number" ? input.temperature : undefined,
     topP: typeof input.top_p === "number" ? input.top_p : undefined,
-    reasoningEffort: normalizeReasoningEffort(input.reasoning?.effort),
+    reasoningEffort: directiveEffort ?? normalizeReasoningEffort(input.reasoning?.effort, input.model),
+    toolRegistry,
+  }
+}
+
+function buildToolRegistry(tools) {
+  const registry = {
+    tools: [],
+    byName: new Map(),
+    byClient: new Map(),
+    bySimpleName: new Map(),
+  }
+  const used = new Set()
+
+  const add = (descriptor) => {
+    const base = sanitizeToolName(descriptor.upstreamName) || "tool"
+    let name = base
+    let suffix = 2
+    while (used.has(name)) name = `${base}_${suffix++}`
+    used.add(name)
+    const entry = { ...descriptor, upstreamName: name }
+    registry.tools.push({
+      name,
+      description: entry.description ?? "",
+      input_schema: entry.input_schema,
+    })
+    registry.byName.set(name, entry)
+    for (const clientName of entry.clientNames ?? []) registry.byClient.set(clientName, name)
+    const simple = registry.bySimpleName.get(entry.name) ?? []
+    if (!simple.includes(name)) simple.push(name)
+    registry.bySimpleName.set(entry.name, simple)
+    return name
+  }
+
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    if (!tool || typeof tool !== "object") continue
+
+    if (tool.type === "namespace") {
+      const namespace = tool.name
+      if (!namespace) continue
+      for (const nested of Array.isArray(tool.tools) ? tool.tools : []) {
+        if (!nested || typeof nested !== "object") continue
+        const description = [tool.description ? `[${namespace}] ${tool.description}` : `[${namespace}]`, nested.description]
+          .filter(Boolean)
+          .join("\n\n")
+        if (nested.type === "custom") {
+          add(customToolDescriptor(nested, namespace, description))
+          continue
+        }
+        if (nested.type === "function" && nested.name) {
+          add({
+            kind: "function",
+            name: nested.name,
+            namespace,
+            upstreamName: `${namespace}__${nested.name}`,
+            description,
+            input_schema: normalizeInputSchema(nested.parameters),
+            clientNames: [`${namespace}__${nested.name}`, `${namespace}.${nested.name}`],
+          })
+        }
+      }
+      continue
+    }
+
+    if (tool.type === "custom" && tool.name) {
+      add(customToolDescriptor(tool))
+      continue
+    }
+
+    const functionSpec = tool.type === "function" ? tool : tool.type === undefined ? tool : undefined
+    if (!functionSpec) continue
+    const name = functionSpec.name ?? functionSpec.function?.name
+    if (!name) continue
+    add({
+      kind: "function",
+      name,
+      namespace: tool.namespace ?? null,
+      upstreamName: tool.namespace ? `${tool.namespace}__${name}` : name,
+      description: functionSpec.description ?? functionSpec.function?.description ?? "",
+      input_schema: normalizeInputSchema(functionSpec.parameters ?? functionSpec.function?.parameters ?? functionSpec.input_schema),
+      clientNames: tool.namespace
+        ? [`${tool.namespace}__${name}`, `${tool.namespace}.${name}`]
+        : [name],
+    })
+  }
+
+  return registry
+}
+
+function customToolDescriptor(tool, namespace, description) {
+  const prefix = namespace ? `[${namespace}] ` : ""
+  const base = description ?? `${prefix}${tool.description ?? ""}`
+  return {
+    kind: "custom",
+    name: tool.name,
+    namespace: namespace ?? null,
+    upstreamName: namespace ? `${namespace}__${tool.name}` : tool.name,
+    description: `${base}\n\nThe function-calling API requires a JSON object, but the "input" field itself is the exact freeform text. Put the complete raw input there without escaping, quoting, or JSON-encoding that value.`,
+    input_schema: {
+      type: "object",
+      properties: {
+        input: { type: "string", description: "The complete raw tool input." },
+      },
+      required: ["input"],
+      additionalProperties: false,
+    },
+    clientNames: namespace ? [`${namespace}__${tool.name}`, `${namespace}.${tool.name}`] : [tool.name],
+  }
+}
+
+function normalizeInputSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return { type: "object", properties: {} }
+  }
+  return {
+    ...schema,
+    type: "object",
+    properties: schema.properties ?? {},
+    ...(Array.isArray(schema.required) ? { required: schema.required } : {}),
+  }
+}
+
+function sanitizeToolName(value) {
+  return String(value ?? "")
+    .replace(/[^A-Za-z0-9_-]/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 64)
+}
+
+function resolveToolName(registry, name, namespace) {
+  const raw = String(name ?? "")
+  if (namespace) {
+    const qualified = registry.byClient.get(`${namespace}__${raw}`) ?? registry.byClient.get(`${namespace}.${raw}`)
+    if (qualified) return qualified
+  }
+  const direct = registry.byClient.get(raw)
+  if (direct) return direct
+  const simple = registry.bySimpleName.get(raw)
+  if (simple?.length === 1) return simple[0]
+  return sanitizeToolName(raw)
+}
+
+function customToolInput(value) {
+  if (typeof value === "string") return value
+  if (value && typeof value === "object") {
+    if (typeof value.input === "string") return value.input
+    if (typeof value.patch === "string") return value.patch
+    if (typeof value.content === "string") return value.content
+    const strings = Object.values(value).filter((entry) => typeof entry === "string")
+    if (strings.length === 1) return strings[0]
+  }
+  return JSON.stringify(value ?? "")
+}
+
+function coerceToolInput(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value
+  if (Array.isArray(value) && value.length === 1 && value[0] && typeof value[0] === "object") return value[0]
+  if (typeof value === "string" && value.trim()) return parseJson(value) ?? { input: value }
+  return {}
+}
+
+function parseToolArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value
+  if (typeof value === "string" && value.trim()) return parseJson(value) ?? {}
+  return {}
+}
+
+function reasoningTextFromItem(item) {
+  return [...(Array.isArray(item.summary) ? item.summary : []), ...(Array.isArray(item.content) ? item.content : [])]
+    .flatMap((part) => (typeof part?.text === "string" ? [part.text] : []))
+    .join("")
+}
+
+function encodeReasoning(text) {
+  if (!text) return undefined
+  return REASONING_PREFIX + zlib.gzipSync(Buffer.from(text, "utf8")).toString("base64url")
+}
+
+function decodeReasoning(value) {
+  if (typeof value !== "string" || !value.startsWith(REASONING_PREFIX)) return undefined
+  try {
+    return zlib.gunzipSync(Buffer.from(value.slice(REASONING_PREFIX.length), "base64url")).toString("utf8")
+  } catch {
+    return undefined
+  }
+}
+
+function lastMessageIndex(messages, role) {
+  let index = -1
+  for (const [current, message] of messages.entries()) {
+    if (typeof message === "string") {
+      if (role === "user") index = current
+      continue
+    }
+    if (message?.role === role) index = current
+  }
+  return index
+}
+
+function readThinkDirective(text, onEffort) {
+  const match = /^\s*\/(no_think|think)(?=\s|$)[ \t]*/i.exec(text)
+  if (!match) return text
+  onEffort?.(match[1].toLowerCase() === "no_think" ? "off" : "high")
+  return text.slice(match[0].length)
+}
+
+function stripThinkControl(text) {
+  return String(text ?? "").replace(/^\s*\/(?:no_think|think)(?=$|\s|[.,;:!?])\s*/i, "")
+}
+
+function stripThinkFromParts(parts, onEffort) {
+  let applied = false
+  return parts.flatMap((part) => {
+    if (part.type !== "text" || applied) return [part]
+    applied = true
+    const text = readThinkDirective(part.text, onEffort)
+    return text ? [{ ...part, text }] : []
+  })
+}
+
+function outputText(value) {
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) {
+    return value
+      .flatMap((part) => {
+        if (typeof part === "string") return [part]
+        if (part?.type === "input_text" || part?.type === "output_text" || part?.type === "text") {
+          return typeof part.text === "string" ? [part.text] : []
+        }
+        if (part?.type === "input_image" || part?.type === "image_url") return ["[image]"]
+        return []
+      })
+      .join("\n")
+  }
+  if (value && typeof value === "object") {
+    if (typeof value.text === "string") return value.text
+    if (typeof value.content === "string") return value.content
+    return JSON.stringify(value)
+  }
+  return String(value ?? "")
+}
+
+class ControlTextFilter {
+  constructor() {
+    this.buffer = ""
+    this.ready = false
+    this.trimLeading = false
+  }
+
+  push(text) {
+    if (typeof text !== "string" || text.length === 0) return ""
+    if (this.trimLeading) {
+      const trimmed = text.replace(/^\s+/, "")
+      if (!trimmed) return ""
+      this.trimLeading = false
+      text = trimmed
+    }
+    if (this.ready) return text
+    this.buffer += text
+    const trimmed = this.buffer.replace(/^\s+/, "")
+    const marker = /^(\/no_think|\/think)(?=$|\s|[.,;:!?])/i.exec(trimmed)
+    if (marker) {
+      this.ready = true
+      this.buffer = ""
+      const output = trimmed.slice(marker[0].length).replace(/^\s+/, "")
+      this.trimLeading = output.length === 0
+      return output
+    }
+    if (trimmed.startsWith("/") && trimmed.length < 12) return ""
+    this.ready = true
+    const output = this.buffer
+    this.buffer = ""
+    return output
+  }
+
+  flush() {
+    if (this.ready) return ""
+    this.ready = true
+    const output = this.buffer
+    this.buffer = ""
+    return output.replace(/^\s*\/(?:no_think|think)(?=$|\s|[.,;:!?])\s*/i, "")
+  }
+
+  reset() {
+    this.buffer = ""
+    this.ready = false
+    this.trimLeading = false
   }
 }
 
@@ -491,7 +955,8 @@ function responsesContentToCommandCode(content) {
       return typeof part.text === "string" ? [{ type: "text", text: part.text }] : []
     }
     if (part.type === "input_image") {
-      const url = part.image_url ?? part.url
+      const raw = part.image_url ?? part.url
+      const url = typeof raw === "string" ? raw : raw?.url
       return typeof url === "string" ? [{ type: "image", image: url, mimeType: mimeTypeOf(url) }] : []
     }
     return []
@@ -499,7 +964,7 @@ function responsesContentToCommandCode(content) {
 }
 
 function buildGenerateBody(input, threadId) {
-  const reasoningEffort = normalizeReasoningEffort(input.reasoningEffort)
+  const reasoningEffort = normalizeReasoningEffort(input.reasoningEffort, input.model)
   return {
     config: {
       workingDir: WORKDIR,
@@ -517,6 +982,7 @@ function buildGenerateBody(input, threadId) {
     skills: null,
     permissionMode: PERMISSION_MODE,
     threadId,
+    mode: MODE,
     params: {
       model: input.model,
       messages: input.messages,
@@ -536,34 +1002,49 @@ function openAIToCommandCode(input) {
   const system = []
   const messages = []
   const toolNames = new Map()
+  const toolRegistry = buildToolRegistry(input.tools)
+  const source = Array.isArray(input.messages) ? input.messages : []
+  const lastUserIndex = lastMessageIndex(source, "user")
+  let directiveEffort
 
-  for (const message of Array.isArray(input.messages) ? input.messages : []) {
+  for (const [messageIndex, message] of source.entries()) {
     if (!message || typeof message !== "object") continue
     if (message.role === "system" || message.role === "developer") {
-      const text = contentText(message.content)
+      const text = readThinkDirective(contentText(message.content), (effort) => (directiveEffort = effort))
       if (text) system.push({ type: "text", text })
       continue
     }
     if (message.role === "assistant") {
-      const content = []
+      const textContent = []
       if (typeof message.content === "string" && message.content.length > 0) {
-        content.push({ type: "text", text: message.content })
+        textContent.push({ type: "text", text: message.content })
       } else if (Array.isArray(message.content)) {
         for (const part of message.content) {
-          if (part?.type === "text" && typeof part.text === "string") content.push({ type: "text", text: part.text })
+          if (
+            (part?.type === "text" || part?.type === "input_text" || part?.type === "output_text") &&
+            typeof part.text === "string"
+          ) {
+            textContent.push({ type: "text", text: part.text })
+          }
         }
       }
-      if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
-        content.push({ type: "reasoning", text: message.reasoning_content })
+      const reasoningContent = []
+      const seenReasoning = new Set()
+      for (const value of [message.reasoning_content, message.reasoning, message.reasoning_text]) {
+        if (typeof value !== "string" || value.length === 0 || seenReasoning.has(value)) continue
+        seenReasoning.add(value)
+        reasoningContent.push({ type: "reasoning", text: stripThinkControl(value) })
       }
+      const content = [...reasoningContent, ...textContent]
       for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
         const name = call.function?.name ?? ""
-        if (call.id) toolNames.set(call.id, name)
+        const upstreamName = resolveToolName(toolRegistry, name) || "unknown"
+        if (call.id) toolNames.set(call.id, upstreamName)
         content.push({
           type: "tool-call",
           toolCallId: call.id ?? "",
-          toolName: name,
-          input: parseJson(call.function?.arguments) ?? {},
+          toolName: upstreamName,
+          input: parseToolArguments(call.function?.arguments),
         })
       }
       if (content.length > 0) messages.push({ role: "assistant", content })
@@ -586,10 +1067,25 @@ function openAIToCommandCode(input) {
 
     const content = []
     if (typeof message.content === "string") {
-      content.push({ type: "text", text: message.content })
+      const text =
+        messageIndex === lastUserIndex
+          ? readThinkDirective(message.content, (effort) => (directiveEffort = effort))
+          : message.content
+      if (text) content.push({ type: "text", text })
     } else if (Array.isArray(message.content)) {
+      let directiveApplied = false
       for (const part of message.content) {
-        if (part?.type === "text" && typeof part.text === "string") content.push({ type: "text", text: part.text })
+        if (
+          (part?.type === "text" || part?.type === "input_text" || part?.type === "output_text") &&
+          typeof part.text === "string"
+        ) {
+          const text =
+            messageIndex === lastUserIndex && !directiveApplied
+              ? readThinkDirective(part.text, (effort) => (directiveEffort = effort))
+              : part.text
+          directiveApplied = true
+          if (text) content.push({ type: "text", text })
+        }
         if (part?.type === "image_url") {
           const url = part.image_url?.url ?? part.image_url
           if (typeof url === "string") content.push({ type: "image", image: url, mimeType: mimeTypeOf(url) })
@@ -601,34 +1097,33 @@ function openAIToCommandCode(input) {
 
   if (system.length === 0) system.push({ type: "text", text: "You are a helpful assistant." })
 
-  let tools = (Array.isArray(input.tools) ? input.tools : [])
-    .filter((tool) => tool?.type === "function" && tool.function?.name)
-    .map((tool) => ({
-      name: tool.function.name,
-      description: tool.function.description ?? "",
-      input_schema: tool.function.parameters ?? { type: "object", properties: {} },
-    }))
+  let tools = toolRegistry.tools
 
   const choice = input.tool_choice
   if (choice === "none") {
     tools = []
   } else if (choice && typeof choice === "object" && choice.type === "function" && choice.function?.name) {
-    system.push({ type: "text", text: `You must call the tool "${choice.function.name}" for this request.` })
+    system.push({
+      type: "text",
+      text: `You must call the tool "${resolveToolName(toolRegistry, choice.function.name)}" for this request.`,
+    })
   } else if (choice === "required") {
     system.push({ type: "text", text: "You must call one of the provided tools for this request." })
   }
 
   const maxTokens = Number(input.max_completion_tokens ?? input.max_tokens)
   return {
-    model: normalizeModel(input.model),
+    model: input.model,
     system,
     messages,
     tools,
     maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.min(64000, Math.floor(maxTokens)) : 64000,
     temperature: typeof input.temperature === "number" ? input.temperature : undefined,
     topP: typeof input.top_p === "number" ? input.top_p : undefined,
-    reasoningEffort: normalizeReasoningEffort(input.reasoning_effort),
+    reasoningEffort:
+      directiveEffort ?? normalizeReasoningEffort(input.reasoning_effort ?? input.reasoning?.effort, input.model),
     stop: input.stop,
+    toolRegistry,
   }
 }
 
@@ -788,13 +1283,12 @@ async function streamOpenAI(upstream, response, options) {
     if (response.writableEnded || response.destroyed) return
     response.write(`data: ${JSON.stringify(value)}\n\n`)
   }
-  const chunk = (delta, finishReason, usage) => ({
+  const chunk = (delta, finishReason) => ({
     id,
     object: "chat.completion.chunk",
     created,
     model: options.model,
     choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
-    ...(usage ? { usage } : {}),
   })
 
   write(chunk({ role: "assistant" }, null))
@@ -809,6 +1303,7 @@ async function streamOpenAI(upstream, response, options) {
       return
     }
     if (event.type === "tool") {
+      const name = options.toolRegistry?.byName.get(event.name)?.name ?? event.name
       write(
         chunk(
           {
@@ -818,7 +1313,7 @@ async function streamOpenAI(upstream, response, options) {
                 id: event.id || `call_${randomID()}`,
                 type: "function",
                 function: {
-                  name: event.name,
+                  name,
                   arguments: JSON.stringify(event.input ?? {}),
                 },
               },
@@ -831,7 +1326,17 @@ async function streamOpenAI(upstream, response, options) {
     }
     if (event.type === "finish") {
       finished = true
-      write(chunk({}, event.reason, options.includeUsage ? openAIUsage(event.usage) : undefined))
+      write(chunk({}, event.reason))
+      if (options.includeUsage) {
+        write({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: options.model,
+          choices: [],
+          usage: openAIUsage(event.usage),
+        })
+      }
       response.write("data: [DONE]\n\n")
       return
     }
@@ -860,15 +1365,35 @@ async function collectCommandCode(upstream) {
     text: "",
     reasoning: "",
     tools: [],
+    blocks: [],
     finish: undefined,
     usage: undefined,
     error: undefined,
   }
 
+  let lastBlock
   await readCommandCode(upstream, (event) => {
-    if (event.type === "text") result.text += event.text
-    if (event.type === "reasoning") result.reasoning += event.text
-    if (event.type === "tool") result.tools.push(event)
+    if (event.type === "text") {
+      if (lastBlock?.type !== "text") {
+        lastBlock = { type: "text", text: "" }
+        result.blocks.push(lastBlock)
+      }
+      lastBlock.text += event.text
+      result.text += event.text
+    }
+    if (event.type === "reasoning") {
+      if (lastBlock?.type !== "reasoning") {
+        lastBlock = { type: "reasoning", text: "" }
+        result.blocks.push(lastBlock)
+      }
+      lastBlock.text += event.text
+      result.reasoning += event.text
+    }
+    if (event.type === "tool") {
+      lastBlock = { type: "tool", tool: event }
+      result.blocks.push(lastBlock)
+      result.tools.push(event)
+    }
     if (event.type === "finish") {
       result.finish = event.reason
       result.usage = event.usage
@@ -881,16 +1406,19 @@ async function collectCommandCode(upstream) {
   return result
 }
 
-async function collectOpenAI(upstream, model) {
+async function collectOpenAI(upstream, model, toolRegistry) {
   const result = await collectCommandCode(upstream)
-  const message = { role: "assistant", content: result.text || "" }
+  const message = {
+    role: "assistant",
+    content: result.text || (result.tools.length > 0 ? null : ""),
+  }
   if (result.reasoning) message.reasoning_content = result.reasoning
   if (result.tools.length > 0) {
     message.tool_calls = result.tools.map((tool) => ({
       id: tool.id || `call_${randomID()}`,
       type: "function",
       function: {
-        name: tool.name,
+        name: toolRegistry?.byName.get(tool.name)?.name ?? tool.name,
         arguments: JSON.stringify(tool.input ?? {}),
       },
     }))
@@ -913,16 +1441,34 @@ async function collectOpenAI(upstream, model) {
   }
 }
 
-function commandCodeToAnthropic(result, model) {
+function commandCodeToAnthropic(result, model, toolRegistry) {
   const content = []
-  if (result.reasoning) content.push({ type: "thinking", thinking: result.reasoning, signature: "" })
-  if (result.text) content.push({ type: "text", text: result.text })
-  for (const tool of result.tools) {
+  const blocks = result.blocks?.length
+    ? result.blocks
+    : [
+        ...(result.reasoning ? [{ type: "reasoning", text: result.reasoning }] : []),
+        ...(result.text ? [{ type: "text", text: result.text }] : []),
+        ...result.tools.map((tool) => ({ type: "tool", tool })),
+      ]
+  for (const block of blocks) {
+    if (block.type === "reasoning") {
+      content.push({
+        type: "thinking",
+        thinking: block.text,
+        signature: encodeReasoning(block.text) ?? "",
+      })
+      continue
+    }
+    if (block.type === "text") {
+      content.push({ type: "text", text: block.text })
+      continue
+    }
+    const tool = block.tool
     content.push({
       type: "tool_use",
       id: tool.id || `toolu_${randomID()}`,
-      name: tool.name,
-      input: tool.input ?? {},
+      name: toolRegistry?.byName.get(tool.name)?.name ?? tool.name,
+      input: parseToolArguments(tool.input),
     })
   }
   if (content.length === 0) content.push({ type: "text", text: "" })
@@ -956,31 +1502,56 @@ function anthropicUsageFromCommandCode(usage) {
   return result
 }
 
-function commandCodeToResponses(result, model) {
+function commandCodeToResponses(result, model, toolRegistry) {
   const output = []
-  if (result.reasoning) {
-    output.push({
-      type: "reasoning",
-      id: `rs_${randomID()}`,
-      summary: [{ type: "summary_text", text: result.reasoning }],
-    })
-  }
-  if (result.text) {
-    output.push({
-      type: "message",
-      id: `msg_${randomID()}`,
-      status: "completed",
-      role: "assistant",
-      content: [{ type: "output_text", text: result.text, annotations: [] }],
-    })
-  }
-  for (const tool of result.tools) {
+  const blocks = result.blocks?.length
+    ? result.blocks
+    : [
+        ...(result.reasoning ? [{ type: "reasoning", text: result.reasoning }] : []),
+        ...(result.text ? [{ type: "text", text: result.text }] : []),
+        ...result.tools.map((tool) => ({ type: "tool", tool })),
+      ]
+  for (const block of blocks) {
+    if (block.type === "reasoning") {
+      output.push({
+        type: "reasoning",
+        id: `rs_${randomID()}`,
+        summary: [{ type: "summary_text", text: block.text }],
+        encrypted_content: encodeReasoning(block.text),
+      })
+      continue
+    }
+    if (block.type === "text") {
+      output.push({
+        type: "message",
+        id: `msg_${randomID()}`,
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: block.text, annotations: [] }],
+      })
+      continue
+    }
+    const tool = block.tool
+    const descriptor = toolRegistry?.byName.get(tool.name)
+    if (descriptor?.kind === "custom") {
+      output.push({
+        type: "custom_tool_call",
+        id: `ctc_${randomID()}`,
+        status: "completed",
+        call_id: tool.id || `call_${randomID()}`,
+        name: descriptor.name,
+        ...(descriptor.namespace ? { namespace: descriptor.namespace } : {}),
+        input: customToolInput(tool.input),
+      })
+      continue
+    }
     output.push({
       type: "function_call",
       id: `fc_${randomID()}`,
       status: "completed",
       call_id: tool.id || `call_${randomID()}`,
-      name: tool.name,
+      name: descriptor?.name ?? tool.name,
+      ...(descriptor?.namespace ? { namespace: descriptor.namespace } : {}),
       arguments: JSON.stringify(tool.input ?? {}),
     })
   }
@@ -1011,11 +1582,12 @@ function responsesUsage(usage) {
   }
 }
 
-async function streamAnthropic(upstream, response, model) {
+async function streamAnthropic(upstream, response, model, toolRegistry) {
   const state = {
     id: `msg_${randomID()}`,
     model,
     next: 0,
+    blocks: [],
     reasoning: undefined,
     text: undefined,
     tools: new Map(),
@@ -1030,7 +1602,8 @@ async function streamAnthropic(upstream, response, model) {
   }
   const ensureReasoning = () => {
     if (state.reasoning) return state.reasoning
-    state.reasoning = { index: state.next++, text: "" }
+    state.reasoning = { kind: "reasoning", index: state.next++, text: "" }
+    state.blocks.push(state.reasoning)
     emit("content_block_start", {
       index: state.reasoning.index,
       content_block: { type: "thinking", thinking: "" },
@@ -1039,19 +1612,23 @@ async function streamAnthropic(upstream, response, model) {
   }
   const ensureText = () => {
     if (state.text) return state.text
-    state.text = { index: state.next++, text: "" }
+    state.text = { kind: "text", index: state.next++, text: "" }
+    state.blocks.push(state.text)
     emit("content_block_start", { index: state.text.index, content_block: { type: "text", text: "" } })
     return state.text
   }
   const ensureTool = (tool) => {
     const key = tool.id || tool.name
     if (state.tools.has(key)) return state.tools.get(key)
+    const descriptor = toolRegistry?.byName.get(tool.name)
     const block = {
+      kind: "tool",
       index: state.next++,
       id: tool.id || `toolu_${randomID()}`,
-      name: tool.name,
+      name: descriptor?.name ?? tool.name,
     }
     state.tools.set(key, block)
+    state.blocks.push(block)
     emit("content_block_start", {
       index: block.index,
       content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
@@ -1096,6 +1673,8 @@ async function streamAnthropic(upstream, response, model) {
         index: block.index,
         delta: { type: "input_json_delta", partial_json: JSON.stringify(event.input ?? {}) },
       })
+      state.text = undefined
+      state.reasoning = undefined
       return
     }
     if (event.type === "finish") {
@@ -1119,18 +1698,19 @@ async function streamAnthropic(upstream, response, model) {
     return
   }
 
-  const blocks = []
-  if (state.reasoning) blocks.push({ index: state.reasoning.index, type: "reasoning" })
-  if (state.text) blocks.push({ index: state.text.index, type: "text" })
-  for (const tool of state.tools.values()) blocks.push({ index: tool.index, type: "tool" })
+  const blocks = [...state.blocks]
   blocks.sort((left, right) => left.index - right.index)
   if (blocks.length === 0) {
     emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } })
     emit("content_block_stop", { index: 0 })
   } else {
     for (const block of blocks) {
-      if (block.type === "reasoning") {
-        emit("content_block_delta", { index: block.index, delta: { type: "signature_delta", signature: "" } })
+      if (block.kind === "reasoning") {
+        const text = block.text ?? ""
+        emit("content_block_delta", {
+          index: block.index,
+          delta: { type: "signature_delta", signature: encodeReasoning(text) ?? "" },
+        })
       }
       emit("content_block_stop", { index: block.index })
     }
@@ -1144,13 +1724,14 @@ async function streamAnthropic(upstream, response, model) {
   response.end()
 }
 
-async function streamResponses(upstream, response, model) {
+async function streamResponses(upstream, response, model, toolRegistry) {
   const state = {
     id: `resp_${randomID()}`,
     created: Math.floor(Date.now() / 1000),
     model,
     sequence: 0,
     next: 0,
+    blocks: [],
     reasoning: undefined,
     text: undefined,
     tools: new Map(),
@@ -1178,7 +1759,8 @@ async function streamResponses(upstream, response, model) {
   }
   const ensureReasoning = () => {
     if (state.reasoning) return state.reasoning
-    state.reasoning = { id: `rs_${randomID()}`, index: state.next++, text: "" }
+    state.reasoning = { kind: "reasoning", id: `rs_${randomID()}`, index: state.next++, text: "" }
+    state.blocks.push(state.reasoning)
     emit("response.output_item.added", {
       output_index: state.reasoning.index,
       item: { type: "reasoning", id: state.reasoning.id, summary: [] },
@@ -1187,7 +1769,8 @@ async function streamResponses(upstream, response, model) {
   }
   const ensureText = () => {
     if (state.text) return state.text
-    state.text = { id: `msg_${randomID()}`, index: state.next++, text: "" }
+    state.text = { kind: "text", id: `msg_${randomID()}`, index: state.next++, text: "" }
+    state.blocks.push(state.text)
     emit("response.output_item.added", {
       output_index: state.text.index,
       item: { type: "message", id: state.text.id, status: "in_progress", role: "assistant", content: [] },
@@ -1197,29 +1780,57 @@ async function streamResponses(upstream, response, model) {
   const ensureTool = (tool) => {
     const key = tool.id || tool.name
     if (state.tools.has(key)) return state.tools.get(key)
-    const block = {
-      id: `fc_${randomID()}`,
-      index: state.next++,
-      callID: tool.id || `call_${randomID()}`,
-      name: tool.name,
-      arguments: JSON.stringify(tool.input ?? {}),
-    }
+    const descriptor = toolRegistry?.byName.get(tool.name)
+    const custom = descriptor?.kind === "custom"
+    const block = custom
+      ? {
+          kind: "custom",
+          custom: true,
+          id: `ctc_${randomID()}`,
+          index: state.next++,
+          callID: tool.id || `call_${randomID()}`,
+          name: descriptor.name,
+          namespace: descriptor.namespace,
+          input: customToolInput(tool.input),
+        }
+      : {
+          kind: "function",
+          custom: false,
+          id: `fc_${randomID()}`,
+          index: state.next++,
+          callID: tool.id || `call_${randomID()}`,
+          name: descriptor?.name ?? tool.name,
+          namespace: descriptor?.namespace ?? null,
+          arguments: JSON.stringify(tool.input ?? {}),
+        }
     state.tools.set(key, block)
+    state.blocks.push(block)
     emit("response.output_item.added", {
       output_index: block.index,
-      item: {
-        type: "function_call",
-        id: block.id,
-        call_id: block.callID,
-        name: block.name,
-        arguments: "",
-        status: "in_progress",
-      },
+      item: custom
+        ? {
+            type: "custom_tool_call",
+            id: block.id,
+            call_id: block.callID,
+            name: block.name,
+            ...(block.namespace ? { namespace: block.namespace } : {}),
+            input: "",
+            status: "in_progress",
+          }
+        : {
+            type: "function_call",
+            id: block.id,
+            call_id: block.callID,
+            name: block.name,
+            ...(block.namespace ? { namespace: block.namespace } : {}),
+            arguments: "",
+            status: "in_progress",
+          },
     })
-    emit("response.function_call_arguments.delta", {
+    emit(custom ? "response.custom_tool_call_input.delta" : "response.function_call_arguments.delta", {
       item_id: block.id,
       output_index: block.index,
-      delta: block.arguments,
+      delta: custom ? block.input : block.arguments,
     })
     return block
   }
@@ -1253,6 +1864,8 @@ async function streamResponses(upstream, response, model) {
     }
     if (event.type === "tool") {
       ensureTool(event)
+      state.text = undefined
+      state.reasoning = undefined
       return
     }
     if (event.type === "finish") {
@@ -1276,64 +1889,83 @@ async function streamResponses(upstream, response, model) {
     return
   }
 
-  const items = []
-  if (state.reasoning) {
-    items.push({
-      index: state.reasoning.index,
-      item: {
-        type: "reasoning",
-        id: state.reasoning.id,
-        summary: [{ type: "summary_text", text: state.reasoning.text }],
-      },
-      done: {
-        type: "response.reasoning_summary_text.done",
-        data: {
-          item_id: state.reasoning.id,
-          output_index: state.reasoning.index,
-          summary_index: 0,
-          text: state.reasoning.text,
+  const items = state.blocks.map((block) => {
+    if (block.kind === "reasoning") {
+      return {
+        index: block.index,
+        item: {
+          type: "reasoning",
+          id: block.id,
+          summary: [{ type: "summary_text", text: block.text }],
+          encrypted_content: encodeReasoning(block.text),
         },
-      },
-    })
-  }
-  if (state.text) {
-    items.push({
-      index: state.text.index,
-      item: {
-        type: "message",
-        id: state.text.id,
-        status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text: state.text.text, annotations: [] }],
-      },
-      done: {
-        type: "response.output_text.done",
-        data: {
-          item_id: state.text.id,
-          output_index: state.text.index,
-          content_index: 0,
-          text: state.text.text,
+        done: {
+          type: "response.reasoning_summary_text.done",
+          data: {
+            item_id: block.id,
+            output_index: block.index,
+            summary_index: 0,
+            text: block.text,
+          },
         },
-      },
-    })
-  }
-  for (const tool of state.tools.values()) {
-    items.push({
-      index: tool.index,
+      }
+    }
+    if (block.kind === "text") {
+      return {
+        index: block.index,
+        item: {
+          type: "message",
+          id: block.id,
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: block.text, annotations: [] }],
+        },
+        done: {
+          type: "response.output_text.done",
+          data: {
+            item_id: block.id,
+            output_index: block.index,
+            content_index: 0,
+            text: block.text,
+          },
+        },
+      }
+    }
+    if (block.kind === "custom") {
+      return {
+        index: block.index,
+        item: {
+          type: "custom_tool_call",
+          id: block.id,
+          status: "completed",
+          call_id: block.callID,
+          name: block.name,
+          ...(block.namespace ? { namespace: block.namespace } : {}),
+          input: block.input,
+        },
+        done: {
+          type: "response.custom_tool_call_input.done",
+          data: { item_id: block.id, output_index: block.index, input: block.input },
+        },
+      }
+    }
+    return {
+      index: block.index,
       item: {
         type: "function_call",
-        id: tool.id,
+        id: block.id,
         status: "completed",
-        call_id: tool.callID,
-        name: tool.name,
-        arguments: tool.arguments,
+        call_id: block.callID,
+        name: block.name,
+        ...(block.namespace ? { namespace: block.namespace } : {}),
+        arguments: block.arguments,
       },
       done: {
         type: "response.function_call_arguments.done",
-        data: { item_id: tool.id, output_index: tool.index, arguments: tool.arguments },
+        data: { item_id: block.id, output_index: block.index, arguments: block.arguments },
       },
-    })
-  }
+    }
+  })
   items.sort((left, right) => left.index - right.index)
   for (const item of items) {
     emit(item.done.type, item.done.data)
@@ -1353,35 +1985,71 @@ async function readCommandCode(upstream, onEvent) {
   let finished = false
   let error
   let lastFinish
+  const textFilter = new ControlTextFilter()
+  const reasoningFilter = new ControlTextFilter()
+
+  const flushFilters = () => {
+    const text = textFilter.flush()
+    if (text) onEvent({ type: "text", text })
+    const reasoning = reasoningFilter.flush()
+    if (reasoning) onEvent({ type: "reasoning", text: reasoning })
+  }
+  const flushBlock = (filter, type) => {
+    const text = filter.flush()
+    if (text) onEvent({ type, text })
+    filter.reset()
+  }
 
   const consume = (line) => {
     if (!line.trim()) return
     const event = parseJson(line)
     if (!event) return
+    if (
+      event.type === "text-start" ||
+      event.type === "text-end" ||
+      event.type === "reasoning-start" ||
+      event.type === "reasoning-end"
+    ) {
+      flushBlock(textFilter, "text")
+      flushBlock(reasoningFilter, "reasoning")
+      return
+    }
     if (event.type === "text-delta") {
-      onEvent({ type: "text", text: event.text ?? "" })
+      const text = textFilter.push(event.text ?? "")
+      if (text) onEvent({ type: "text", text })
       return
     }
     if (event.type === "reasoning-delta") {
-      onEvent({ type: "reasoning", text: event.text ?? "" })
+      const text = reasoningFilter.push(event.text ?? "")
+      if (text) onEvent({ type: "reasoning", text })
       return
     }
     if (event.type === "tool-call") {
+      if (event.providerExecuted === true) return
+      flushBlock(textFilter, "text")
+      flushBlock(reasoningFilter, "reasoning")
       onEvent({
         type: "tool",
         id: event.toolCallId ?? "",
         name: event.toolName ?? "",
-        input: event.input ?? {},
+        input: coerceToolInput(event.input ?? event.args),
       })
       return
     }
     if (event.type === "finish") {
+      flushFilters()
       finished = true
       onEvent({
         type: "finish",
-        reason: normalizeFinishReason(event.finishReason ?? event.rawFinishReason),
-        usage: event.totalUsage ?? event.usage,
+        reason: normalizeFinishReason(event.finishReason ?? event.rawFinishReason ?? lastFinish?.reason),
+        usage: event.totalUsage ?? event.usage ?? lastFinish?.usage,
       })
+      return
+    }
+    if (event.type === "abort") {
+      flushFilters()
+      finished = true
+      onEvent({ type: "finish", reason: "stop", usage: undefined })
       return
     }
     if (event.type === "finish-step") {
@@ -1410,6 +2078,7 @@ async function readCommandCode(upstream, onEvent) {
   }
   buffer += decoder.decode()
   if (buffer.trim()) consume(buffer)
+  if (!finished) flushFilters()
   if (!finished && lastFinish) {
     finished = true
     onEvent({ type: "finish", reason: lastFinish.reason, usage: lastFinish.usage })
@@ -1426,7 +2095,28 @@ function normalizeFinishReason(reason) {
   return "stop"
 }
 
-function normalizeReasoningEffort(value) {
+function normalizeReasoningEffort(value, model) {
+  const effort = normalizeReasoningEffortValue(value)
+  if (!effort || !model) return effort
+  const supported = catalogCache?.find((entry) => entry.id === model)?.reasoningEfforts
+  if (!Array.isArray(supported) || supported.length === 0 || supported.includes(effort)) return effort
+  const order = ["off", "low", "medium", "high", "xhigh", "max"]
+  const target = order.indexOf(effort)
+  let best = supported[0]
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const candidate of supported) {
+    const index = order.indexOf(candidate)
+    if (index === -1) continue
+    const distance = Math.abs(index - target)
+    if (distance < bestDistance || (distance === bestDistance && index > order.indexOf(best))) {
+      best = candidate
+      bestDistance = distance
+    }
+  }
+  return best
+}
+
+function normalizeReasoningEffortValue(value) {
   if (value === undefined) return undefined
   if (value === null || value === false) return "off"
   if (typeof value === "number") {
@@ -1442,6 +2132,7 @@ function normalizeReasoningEffort(value) {
   if (!normalized) return "off"
   if (["none", "off", "disabled", "false", "no"].includes(normalized)) return "off"
   if (["minimal", "minimum"].includes(normalized)) return "low"
+  if (normalized === "ultra") return "max"
   if (["low", "medium", "high", "xhigh", "max"].includes(normalized)) return normalized
   if (["auto", "default", "model_default"].includes(normalized)) return undefined
   return undefined
@@ -1472,7 +2163,14 @@ function readError(event) {
 
 function errorStatus(message) {
   const value = String(message).toLowerCase()
+  if (value.includes("model/provider not recognized") || value.includes("model_not_found") || value.includes("unknown model")) {
+    return 404
+  }
+  if (value.includes("bad_request") || value.includes("validation error") || value.includes("invalid option")) {
+    return 400
+  }
   if (value.includes("model_not_in_plan") || value.includes("not available for your plan")) return 403
+  if (value.includes("forbidden")) return 403
   if (value.includes("insufficient credits") || value.includes("premium_credits_exhausted")) return 402
   if (value.includes("rate limit") || value.includes("too many requests")) return 429
   return 502
@@ -1500,6 +2198,7 @@ async function loadModels() {
   if (catalogCache && Date.now() - catalogCacheAt < 5 * 60 * 1000) return catalogCache
   const upstream = await fetch(`${BASE_URL}/provider/v1/models?view=client`, {
     headers: { accept: "application/json", "user-agent": "node" },
+    signal: AbortSignal.timeout(5000),
   })
   if (!upstream.ok) throw new HttpError(upstream.status, "Could not load the Command Code model catalog")
   const data = await upstream.json()
@@ -1511,16 +2210,54 @@ async function loadModels() {
   return catalogCache
 }
 
-function threadIdFrom(headers) {
-  const value = headers["x-cmdc-thread-id"] ?? headers["x-session-id"]
-  if (typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
-    return value
+async function resolveModel(model) {
+  const normalized = normalizeModel(model)
+  const alias = MODEL_ALIASES[normalized.toLowerCase()]
+  if (alias) return alias
+  const models = await loadModels().catch(() => [])
+  const lower = normalized.toLowerCase()
+  const exact = models.find((entry) => String(entry.id).toLowerCase() === lower)
+  if (exact) return exact.id
+  const byName = models.find((entry) => {
+    const label = String(entry.display?.label ?? entry.name ?? "").toLowerCase()
+    const bare = label.replace(/\s*\(latest\)\s*$/, "")
+    return bare === lower || bare.replace(/\s+/g, "-") === lower || bare.replace(/\s+/g, "/") === lower
+  })
+  return byName?.id ?? normalized
+}
+
+function threadIdFrom(headers, body) {
+  const values = [
+    headers["x-cmdc-thread-id"],
+    headers["x-session-id"],
+    headers["session-id"],
+    headers["thread-id"],
+    headers["x-client-request-id"],
+    body?.prompt_cache_key,
+    body?.client_metadata?.session_id,
+    body?.client_metadata?.thread_id,
+  ]
+  for (const value of values) {
+    if (isUuid(value)) return value
   }
-  return DEFAULT_THREAD_ID ?? crypto.randomUUID()
+  if (DEFAULT_THREAD_ID) return DEFAULT_THREAD_ID
+  const seed = values.find((value) => typeof value === "string" && value.length > 0)
+  if (seed) {
+    const hex = crypto.createHash("sha256").update(seed).digest("hex")
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+  }
+  return crypto.randomUUID()
+}
+
+function isUuid(value) {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+  )
 }
 
 function normalizeModel(model) {
-  return String(model).replace(/^cmdc\//, "").replace(/^command-code\//, "")
+  return String(model).replace(/^cmdc\//i, "").replace(/^command-code\//i, "").trim()
 }
 
 function contentText(content) {
@@ -1529,7 +2266,12 @@ function contentText(content) {
   return content
     .flatMap((part) => {
       if (typeof part === "string") return [part]
-      if (part?.type === "text" && typeof part.text === "string") return [part.text]
+      if (
+        (part?.type === "text" || part?.type === "input_text" || part?.type === "output_text") &&
+        typeof part.text === "string"
+      ) {
+        return [part.text]
+      }
       return []
     })
     .join("")
