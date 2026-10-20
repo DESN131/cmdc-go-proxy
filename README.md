@@ -2,7 +2,7 @@
 
 <p align="center">
   Use Command Code Go models from other software and agents<br>
-  OpenAI Chat Completions · Responses API · Anthropic Messages · Streaming
+  OpenAI Chat Completions · Streaming · Tool calls · Reasoning
 </p>
 
 <p align="center">
@@ -66,72 +66,37 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-### Anthropic Messages
-
-```python
-from anthropic import Anthropic
-
-client = Anthropic(
-    base_url="http://127.0.0.1:8787",
-    api_key="local",
-)
-
-message = client.messages.create(
-    model="deepseek/deepseek-v4-flash",
-    max_tokens=200,
-    messages=[{"role": "user", "content": "Say hello"}],
-)
-
-print(message.content)
-```
-
-### OpenAI Responses
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://127.0.0.1:8787/v1",
-    api_key="local",
-)
-
-response = client.responses.create(
-    model="deepseek/deepseek-v4-flash",
-    input="Say hello",
-)
-
-print(response.output_text)
-```
-
 ## How It Works
 
 - Reads the existing Command Code CLI login.
 - Sends requests to `https://api.commandcode.ai/alpha/generate`.
 - Adds the Command Code CLI request headers.
-- Translates Command Code's newline-delimited event stream into the client protocol.
+- Translates Command Code's newline-delimited event stream into OpenAI Chat Completions chunks and responses.
 - Supports streaming and non-streaming requests, function tools, Codex custom tools, namespaced tools, reasoning content, and usage.
-- Replays assistant reasoning on later turns and keeps a stable upstream thread per client conversation. If a stream ends before completion, the proxy closes it with a valid terminal event and rotates the upstream thread so the next turn can continue.
+- Replays assistant reasoning on later turns and keeps a stable upstream thread per client conversation. A valid upstream `finish` stops reading immediately instead of waiting for the connection to close. Premature EOF is terminated with a valid client event, logged as an error, and followed by an upstream-thread rotation.
+- If an attempt fails before producing any text, reasoning, or tool call, the proxy retries once on a new upstream thread. If both attempts are empty, the request fails with `502` instead of returning a successful empty completion.
+- Applies `CMDC_STREAM_IDLE_TIMEOUT_MS` both while waiting for response headers and while reading a stream, so a stalled upstream cannot hold a request open indefinitely.
 - Repairs incomplete tool-call history before forwarding: missing tool results are filled with an interrupted-result marker and orphan results are dropped. Consecutive user messages are forwarded unchanged.
-- Preserves empty assistant turns with a short placeholder instead of dropping them, so role order and conversation boundaries stay intact.
+- Preserves empty assistant turns as empty content by default, so role order and conversation boundaries stay intact without rewriting the prompt-cache prefix. Set `CMDC_EMPTY_ASSISTANT_PLACEHOLDER=1` only if an upstream compatibility workaround is required.
 - Enforces an upstream transport size guard. By default, oversized requests are rejected with `context_length_exceeded`; history is never rewritten.
 
-### Codex / Responses tools
+### Tool compatibility
 
-Codex sends `apply_patch` as a freeform `custom` tool and groups MCP tools in `namespace` tools. The proxy exposes both as ordinary function tools upstream, then converts the returned calls back into `custom_tool_call` / namespaced `function_call` items. This is required for Codex to edit files and use MCP tools through the proxy.
+The endpoint accepts standard Chat Completions function tools. It also accepts `custom` and `namespace` tool descriptors used by some Codex-compatible clients, flattening them into ordinary function tools upstream and returning standard `tool_calls` chunks. Freeform custom-tool input is carried in an `input` string argument.
 
-Responses reasoning items are preserved. The proxy emits `encrypted_content` in a compact local encoding so the next turn can replay the same reasoning text; opaque reasoning from other providers is replayed as an empty reasoning block.
+Assistant reasoning is returned in the `reasoning_content` field when the upstream model emits it, so compatible clients can replay it on later turns.
 
 ### Thinking directives
 
-Leading `/think` and `/no_think` directives in the latest user message are removed before forwarding and mapped to reasoning effort. The same control markers are stripped from the beginning of streamed reasoning and content, so they do not appear in the client UI.
+Leading `/think` and `/no_think` directives in user messages are removed deterministically before forwarding. Only the latest user message controls the current request's reasoning effort; older user messages are stripped too, so the same conversation prefix does not change between turns. System/developer messages are never interpreted as control directives. The same control markers are stripped from the beginning of streamed reasoning/content, so they do not appear in the client UI.
+
+The proxy rejects unsupported semantic Chat options with `unsupported_parameter` instead of silently ignoring them. `n` must be `1`; `logprobs`/`top_logprobs`, `seed`, and unknown `response_format` types are unsupported. `response_format: json_object`/`json_schema` and `parallel_tool_calls: false` are forwarded as best-effort system constraints because the Command Code API does not expose exact equivalents.
 
 ## Endpoints
 
 | Endpoint | Description |
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
-| `POST /v1/responses` | OpenAI Responses API |
-| `POST /v1/messages` | Anthropic Messages API |
 | `GET /v1/models` | Models available on the configured plan |
 | `GET /v1/usage` | Account, plan, credits, and usage summary |
 | `GET /v1/usage/whoami` | Account information |
@@ -206,6 +171,8 @@ This keeps clients such as Cherry Studio working when reasoning is disabled.
 | `CMDC_ZDR` | unset | Set to `1` to send `x-cmd-zdr` |
 | `CMDC_DEBUG` | unset | Set to `1` to write per-request JSONL diagnostics |
 | `CMDC_DEBUG_DIR` | `<workdir>/.cmdc-debug` | Debug log directory; setting this variable also enables debug mode |
+| `CMDC_STREAM_IDLE_TIMEOUT_MS` | `120000` | Maximum idle time while waiting for upstream headers or stream chunks; set to `0` to disable |
+| `CMDC_EMPTY_ASSISTANT_PLACEHOLDER` | unset | Set to `1` to replace empty assistant history with a compatibility placeholder |
 | `CMDC_CONTEXT_MODE` | `error` | `error` rejects oversized requests without changing history; `auto` trims old images above the size limit; `passthrough` disables the guard; `strip-images` always trims |
 | `CMDC_MAX_REQUEST_BYTES` | `8388608` | Soft size threshold used by `auto` and `error` modes |
 | `CMDC_HARD_REQUEST_BYTES` | `12582912` | Hard limit; larger requests are rejected with `context_length_exceeded` |
@@ -227,8 +194,7 @@ Conversation compaction remains the harness's responsibility. The default `error
 
 ## Limitations
 
-- Only Chat Completions, Responses, and Anthropic Messages are implemented. Embeddings, image generation, audio, and native provider routes are not exposed.
-- Responses translation does not support `previous_response_id`, background tasks, hosted tools, or file inputs.
+- Only OpenAI Chat Completions chat requests are implemented. Responses, Anthropic Messages, embeddings, image generation, audio, and native provider routes are not exposed. Unsupported Chat fields are rejected explicitly rather than silently degraded.
 - Tool choice is expressed with a system instruction. `tool_choice: "none"` omits tools.
 - Function, custom, and namespaced tools are supported. Hosted tools such as `web_search` are not exposed upstream.
 - Reasoning effort is clamped to the selected model's supported values from the Command Code catalog.

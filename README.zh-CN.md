@@ -2,7 +2,7 @@
 
 <p align="center">
   让其他软件和 agent 使用 Command Code Go 模型<br>
-  OpenAI Chat Completions · Responses API · Anthropic Messages · 流式输出
+  OpenAI Chat Completions · 流式输出 · 工具调用 · 推理内容
 </p>
 
 <p align="center">
@@ -66,72 +66,37 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-### Anthropic Messages
-
-```python
-from anthropic import Anthropic
-
-client = Anthropic(
-    base_url="http://127.0.0.1:8787",
-    api_key="local",
-)
-
-message = client.messages.create(
-    model="deepseek/deepseek-v4-flash",
-    max_tokens=200,
-    messages=[{"role": "user", "content": "Say hello"}],
-)
-
-print(message.content)
-```
-
-### OpenAI Responses
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://127.0.0.1:8787/v1",
-    api_key="local",
-)
-
-response = client.responses.create(
-    model="deepseek/deepseek-v4-flash",
-    input="Say hello",
-)
-
-print(response.output_text)
-```
-
 ## 工作原理
 
 - 读取本机 Command Code CLI 的登录信息。
 - 请求 `https://api.commandcode.ai/alpha/generate`。
 - 自动添加 Command Code CLI 所需的请求头。
-- 将 Command Code 的逐行事件流转换为客户端协议。
+- 将 Command Code 的逐行事件流转换为 OpenAI Chat Completions 的分块和完整响应。
 - 支持流式、非流式、函数工具、Codex 自定义工具、命名空间工具、推理内容和 usage。
-- 在后续轮次回放助手推理，并为同一客户端会话保持稳定的上游线程。上游流提前结束时，代理会补发合法终止事件并自动切换上游线程，下一轮可继续对话。
+- 在后续轮次回放助手推理，并为同一客户端会话保持稳定的上游线程。收到合法的上游 `finish` 后会立即停止读取，不再等待连接关闭。上游提前 EOF 时会补发合法终止事件、记录错误并切换上游线程。
+- 如果一次尝试在产生任何文本、推理或工具调用前失败，代理会切换到新线程重试一次；两次都没有有效输出时返回 `502`，不会伪装成成功的空回复。
+- `CMDC_STREAM_IDLE_TIMEOUT_MS` 同时约束等待响应头读取流数据的空闲时间，避免上游卡住后请求永久挂起。
 - 转发前修复不完整的工具调用历史：缺失的工具结果会补为“执行被中断”的结果，孤立的工具结果会被丢弃；连续的用户消息按原样转发，不再合并。
-- 空的助手轮次会用占位消息保留，避免角色顺序和对话边界被破坏。
+- 空的助手轮次默认保留为空内容，避免角色顺序和对话边界被破坏，也不额外改写提示词缓存前缀。只有在确有上游兼容需求时才设置 `CMDC_EMPTY_ASSISTANT_PLACEHOLDER=1` 使用占位文本。
 - 提供上游传输层体积保护。默认超限请求会返回 `context_length_exceeded`，代理不会改写历史。
 
-### Codex / Responses 工具
+### 工具兼容性
 
-Codex 会把 `apply_patch` 作为自由格式的 `custom` 工具发送，并把 MCP 工具放在 `namespace` 工具中。代理会先把它们展开为普通的函数工具发给上游，再把上游返回的调用还原为 `custom_tool_call` 或带命名空间的 `function_call`。这是 Codex 通过代理编辑文件和调用 MCP 工具所必需的。
+接口支持标准 Chat Completions 函数工具，也接受部分 Codex 兼容客户端使用的 `custom` 和 `namespace` 工具描述。代理会把它们展开成普通函数工具发给上游，并以标准 `tool_calls` 分块返回；自由格式自定义工具的内容放在 `input` 字符串参数中。
 
-Responses 的 reasoning 项会被保留。代理用一种紧凑的本地编码写入 `encrypted_content`，以便下一轮回放相同的推理文本；其他来源的不可读 reasoning 会以空推理块回放。
+上游模型输出推理内容时，代理会通过 `reasoning_content` 字段返回，兼容客户端可以在后续轮次回放。
 
 ### 思考指令
 
-最新用户消息开头的 `/think` 和 `/no_think` 会在转发前移除，并转换为推理强度。流式输出开头出现的同类控制标记也会被移除，避免出现在客户端界面中。
+所有用户消息开头的 `/think` 和 `/no_think` 都会在转发前确定性移除；只有最新用户消息的标记会改变本次请求的推理强度。这样同一段历史在后续轮次中不会因旧标记重新出现而改变前缀。System/developer 消息不会被当作控制指令解析。流式输出开头出现的同类控制标记也会被移除，避免出现在客户端界面中。
+
+不支持的语义级 Chat 参数会返回 `unsupported_parameter`，而不是静默忽略：`n` 必须为 `1`；`logprobs`/`top_logprobs`、`seed` 和未知的 `response_format` 类型不受支持。`response_format: json_object`/`json_schema` 与 `parallel_tool_calls: false` 会转换为尽力而为的 system 约束，因为 Command Code API 没有精确等价参数。
 
 ## 端点
 
 | 端点 | 说明 |
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
-| `POST /v1/responses` | OpenAI Responses API |
-| `POST /v1/messages` | Anthropic Messages API |
 | `GET /v1/models` | 当前套餐可用的模型 |
 | `GET /v1/usage` | 账号、订阅、额度和用量汇总 |
 | `GET /v1/usage/whoami` | 账号信息 |
@@ -206,6 +171,8 @@ Command Code 接受 `off`、`low`、`medium`、`high`、`xhigh`、`max`。代理
 | `CMDC_ZDR` | 未设置 | 设为 `1` 时发送 `x-cmd-zdr` |
 | `CMDC_DEBUG` | 未设置 | 设为 `1` 时写入逐请求的 JSONL 诊断日志 |
 | `CMDC_DEBUG_DIR` | `<工作目录>/.cmdc-debug` | 调试日志目录；设置该变量也会启用 debug 模式 |
+| `CMDC_STREAM_IDLE_TIMEOUT_MS` | `120000` | 等待上游响应头或流数据的最长空闲时间；设为 `0` 可关闭 |
+| `CMDC_EMPTY_ASSISTANT_PLACEHOLDER` | 未设置 | 设为 `1` 时用兼容占位文本替换空助手历史 |
 | `CMDC_CONTEXT_MODE` | `error` | `error` 直接拒绝超限请求且不改写历史；`auto` 超限时移除旧图片；`passthrough` 关闭保护；`strip-images` 总是移除旧图片 |
 | `CMDC_MAX_REQUEST_BYTES` | `8388608` | `auto` 和 `error` 模式使用的软阈值 |
 | `CMDC_HARD_REQUEST_BYTES` | `12582912` | 硬上限；超过时返回 `context_length_exceeded` |
@@ -227,8 +194,7 @@ npm start
 
 ## 限制
 
-- 只实现 Chat Completions、Responses 和 Anthropic Messages。不暴露 embeddings、图片生成、音频和原生 provider 路由。
-- Responses 翻译不支持 `previous_response_id`、后台任务、托管工具和文件输入。
+- 只实现 OpenAI Chat Completions 聊天请求。不暴露 Responses、Anthropic Messages、embeddings、图片生成、音频和原生 provider 路由；不支持的 Chat 字段会明确拒绝，不会静默降级。
 - 工具选择通过 system 指令表达；`tool_choice: "none"` 会直接省略工具。
 - 支持函数工具、自定义工具和命名空间工具；`web_search` 等托管工具不会透传到上游。
 - 推理强度会根据 Command Code 模型目录中该模型支持的值自动收敛。

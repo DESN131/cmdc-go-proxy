@@ -6,7 +6,8 @@
   "description": "OpenAI-compatible proxy for Command Code Go models.",
   "scripts": {
     "start": "node cmdc-proxy.mjs",
-    "check": "node --check cmdc-proxy.mjs"
+    "check": "node --check cmdc-proxy.mjs && node --check test/cmdc-proxy.test.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=20"

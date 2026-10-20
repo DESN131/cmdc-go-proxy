@@ -19,7 +19,6 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import zlib from "node:zlib"
 
 const CONFIGURED_PORT = Number(process.env.PORT ?? 8787)
 const PORT = Number.isInteger(CONFIGURED_PORT) && CONFIGURED_PORT >= 0 ? CONFIGURED_PORT : 8787
@@ -54,7 +53,14 @@ const MODES = new Set([
 const MODE = MODES.has(process.env.CMDC_MODE) ? process.env.CMDC_MODE : "agent"
 const DEFAULT_THREAD_ID = isUuid(process.env.CMDC_THREAD_ID) ? process.env.CMDC_THREAD_ID : undefined
 const MAX_BODY_BYTES = 64 * 1024 * 1024
-const REASONING_PREFIX = "cmdc1:"
+const configuredStreamIdleTimeout = Number(process.env.CMDC_STREAM_IDLE_TIMEOUT_MS ?? 120000)
+const STREAM_IDLE_TIMEOUT_MS =
+  Number.isFinite(configuredStreamIdleTimeout) && configuredStreamIdleTimeout >= 0
+    ? Math.floor(configuredStreamIdleTimeout)
+    : 120000
+const EMPTY_ASSISTANT_PLACEHOLDER = ["1", "true", "yes", "on"].includes(
+  String(process.env.CMDC_EMPTY_ASSISTANT_PLACEHOLDER ?? "false").trim().toLowerCase(),
+)
 
 const MODEL_ALIASES = {
   "deepseek-flash": "deepseek/deepseek-v4.1-flash",
@@ -239,6 +245,8 @@ function createRequestStats(protocol, model, stream) {
     startedAt: Date.now(),
     firstOutputAt: null,
     lastOutputAt: null,
+    outputChunks: 0,
+    attempts: 0,
     status: null,
     usage: null,
     error: null,
@@ -250,6 +258,7 @@ function markOutput(stats) {
   const now = Date.now()
   if (stats.firstOutputAt === null) stats.firstOutputAt = now
   stats.lastOutputAt = now
+  stats.outputChunks += 1
 }
 
 function usageSnapshot(usage) {
@@ -288,10 +297,10 @@ function logRequest(stats) {
       ? null
       : Math.max(0, stats.lastOutputAt - stats.firstOutputAt)
   // Token speed uses the observed generation window; total latency includes queueing and TTFT.
-  const speedWindowMs = generationMs !== null && generationMs > 0 ? generationMs : elapsedMs
-  const speed = usage && usage.output > 0 && speedWindowMs > 0
+  const speedWindowMs = stats.outputChunks >= 2 && generationMs !== null && generationMs > 0 ? generationMs : null
+  const speed = usage && usage.output > 0 && speedWindowMs !== null
     ? (usage.output / (speedWindowMs / 1000)).toFixed(1)
-    : "0.0"
+    : "n/a"
   const ttft = ttftMs === null ? "" : ` ttft=${formatDuration(ttftMs)}`
   const generation = generationMs !== null && generationMs > 0 ? ` gen=${formatDuration(generationMs)}` : ""
   const status = stats.status ? `${stats.status} ` : ""
@@ -424,25 +433,18 @@ async function handle(request, response) {
     return
   }
 
-  if (request.method === "POST" && url.pathname.endsWith("/chat/completions")) {
+  if (
+    request.method === "POST" &&
+    (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")
+  ) {
     await proxyChat(request, response)
-    return
-  }
-
-  if (request.method === "POST" && url.pathname.endsWith("/messages")) {
-    await proxyAnthropic(request, response)
-    return
-  }
-
-  if (request.method === "POST" && url.pathname.endsWith("/responses")) {
-    await proxyResponses(request, response)
     return
   }
 
   json(response, 404, {
     error: {
       type: "not_found",
-      message: "Use /v1/chat/completions, /v1/responses, /v1/messages, /v1/models, /v1/usage or /health",
+      message: "Use /v1/chat/completions, /v1/models, /v1/usage or /health",
     },
   })
 }
@@ -456,274 +458,201 @@ async function proxyChat(request, response) {
   if (!Array.isArray(input.messages)) {
     throw new HttpError(400, "messages must be an array")
   }
+  validateChatOptions(input)
 
   const wantsStream = input.stream === true
+  const stats = createRequestStats("chat", input.model, wantsStream)
   const model = await resolveModel(input.model)
+  stats.model = model
   const clientThreadId = threadIdFrom(request.headers, input)
-  const threadId = resolveThreadId(clientThreadId)
-  const stats = createRequestStats("chat", model, wantsStream)
   const debug = createDebugLog("chat", request)
   stats.debug = debug
   if (debug) response.on("close", () => setImmediate(() => finishDebug(debug, stats)))
   const controller = new AbortController()
   response.on("close", () => controller.abort())
   const converted = openAIToCommandCode({ ...input, model })
-  const headers = buildHeaders(threadId)
-  const upstreamBody = buildGenerateBody(converted, threadId)
-  const context = applyContextGuard(upstreamBody)
   debug?.write("client_request", { protocol: "chat", headers: redactedHeaders(request.headers), body: input })
-  debug?.write("upstream_request", { threadId, headers: redactedHeaders(headers), body: upstreamBody, context })
 
-  const upstream = await fetch(`${BASE_URL}/alpha/generate`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(upstreamBody),
-    signal: controller.signal,
-  }).catch((error) => {
-    debug?.write("fetch_error", { message: error instanceof Error ? error.message : String(error) })
-    return { error }
-  })
-
-  if (!("error" in upstream)) {
-    debug?.write("upstream_response", {
-      status: upstream.status,
-      headers: redactedHeaders(Object.fromEntries(upstream.headers)),
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    stats.attempts = attempt + 1
+    const threadId = resolveThreadId(clientThreadId)
+    const upstreamBody = buildGenerateBody(converted, threadId)
+    const context = applyContextGuard(upstreamBody)
+    const headers = buildHeaders(threadId)
+    debug?.write("upstream_request", {
+      attempt: stats.attempts,
+      threadId,
+      headers: redactedHeaders(headers),
+      body: upstreamBody,
+      context,
     })
-  }
 
-  if ("error" in upstream) {
-    if (upstream.error?.name === "AbortError") {
-      stats.error = "aborted"
+    const fetched = await fetchCommandCode(upstreamBody, headers, controller, debug)
+    if (fetched.error) {
+      if (fetched.error?.name === "AbortError") {
+        stats.error = "aborted"
+        logRequest(stats)
+        response.end()
+        return
+      }
+      stats.error =
+        fetched.error?.name === "TimeoutError"
+          ? `upstream response headers idle for ${STREAM_IDLE_TIMEOUT_MS}ms`
+          : fetched.error instanceof Error
+            ? fetched.error.message
+            : String(fetched.error)
+      if (fetched.error?.name === "TimeoutError" && attempt === 0) {
+        logWarn("upstream response headers timed out; retrying once on a new thread")
+        rotateThreadId(clientThreadId)
+        continue
+      }
       logRequest(stats)
-      response.end()
+      throw new HttpError(502, stats.error)
+    }
+    const upstream = fetched.upstream
+
+    stats.status = upstream.status
+    if (!upstream.ok) {
+      const { message, type, code } = await readUpstreamFailure(upstream)
+      stats.error = message
+      logRequest(stats)
+      json(response, upstream.status, {
+        error: { type, message, ...(code ? { code } : {}) },
+      })
       return
     }
-    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
-    logRequest(stats)
-    throw new HttpError(502, upstream.error instanceof Error ? upstream.error.message : String(upstream.error))
-  }
 
-  stats.status = upstream.status
-  if (!upstream.ok) {
-    const text = await upstream.text()
-    const parsed = parseJson(text)
-    const message =
-      ((typeof parsed?.error === "string" ? parsed.error : parsed?.error?.message) ??
-        parsed?.message ??
-        text) ||
-      `Command Code request failed (${upstream.status})`
-    stats.error = message
-    logRequest(stats)
-    json(response, upstream.status, {
-      error: {
-        type: parsed?.error?.type ?? "upstream_error",
-        message,
-        ...(parsed?.error?.code ? { code: parsed.error.code } : {}),
-      },
-    })
-    return
-  }
-
-  if (wantsStream) {
-    response.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    })
-    try {
+    if (wantsStream) {
       const result = await streamOpenAI(upstream, response, {
         model,
         includeUsage: input.stream_options?.include_usage === true,
         toolRegistry: converted.toolRegistry,
         stats,
-      })
-      stats.usage = result?.usage
-      stats.error = result?.error
+      }).catch((error) => ({ error, finished: false, hadOutput: false }))
+
+      if (result.error?.name === "AbortError") {
+        stats.error = "aborted"
+        logRequest(stats)
+        return
+      }
+      stats.usage = result.usage
+      stats.error = result.error
+      if (!result.hadOutput) {
+        if (attempt === 0) {
+          logWarn("upstream produced no output; retrying once on a new thread")
+          rotateThreadId(clientThreadId)
+          continue
+        }
+        const message = result.error ?? "Command Code returned an empty completion"
+        stats.error = message
+        logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
+        rotateThreadId(clientThreadId)
+        logRequest(stats)
+        throw new HttpError(502, message)
+      }
+
       logRequest(stats)
-      if (!result?.finished || result?.error) {
+      if (!result.finished || result.error) {
         logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
         rotateThreadId(clientThreadId)
       }
-    } catch (error) {
+      return
+    }
+
+    const collected = await collectOpenAI(upstream, model, converted.toolRegistry, stats).catch((error) => ({ error }))
+    if (collected.error) {
+      stats.error = collected.error instanceof Error ? collected.error.message : String(collected.error)
+      if (!collected.hadOutput && attempt === 0) {
+        logWarn("upstream produced no output; retrying once on a new thread")
+        rotateThreadId(clientThreadId)
+        continue
+      }
       logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
       rotateThreadId(clientThreadId)
-      stats.error = error?.name === "AbortError" ? "aborted" : error instanceof Error ? error.message : String(error)
       logRequest(stats)
-      if (error?.name !== "AbortError") throw error
+      throw collected.error
     }
+    if (!collected.hadOutput) {
+      if (attempt === 0) {
+        logWarn("upstream produced no output; retrying once on a new thread")
+        rotateThreadId(clientThreadId)
+        continue
+      }
+      const message = "Command Code returned an empty completion"
+      stats.error = message
+      logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
+      rotateThreadId(clientThreadId)
+      logRequest(stats)
+      throw new HttpError(502, message)
+    }
+
+    stats.usage = collected.usage
+    logRequest(stats)
+    json(response, 200, collected.body)
     return
   }
+}
 
-  try {
-    const result = await collectOpenAI(upstream, model, converted.toolRegistry, stats)
-    stats.usage = result.usage
-    logRequest(stats)
-    json(response, 200, result)
-  } catch (error) {
-    logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
-    rotateThreadId(clientThreadId)
-    stats.error = error instanceof Error ? error.message : String(error)
-    logRequest(stats)
-    throw error
+function validateChatOptions(input) {
+  const unsupported = (name, value, detail) => {
+    throw new HttpError(
+      400,
+      `${name}=${JSON.stringify(value)} is not supported by this proxy${detail ? `: ${detail}` : ""}`,
+      "unsupported_parameter",
+    )
+  }
+  if (input.n !== undefined && Number(input.n) !== 1) unsupported("n", input.n, "only one choice is available")
+  if (input.logprobs === true || Number(input.top_logprobs ?? 0) > 0) {
+    unsupported("logprobs", input.logprobs ?? input.top_logprobs, "token log probabilities are unavailable")
+  }
+  if (input.seed !== undefined && input.seed !== null) {
+    unsupported("seed", input.seed, "deterministic sampling is unavailable")
+  }
+  const responseFormat = input.response_format
+  if (responseFormat && !["text", "json_object", "json_schema"].includes(responseFormat.type)) {
+    unsupported("response_format", responseFormat, "the requested response format is unavailable")
   }
 }
 
-async function proxyAnthropic(request, response) {
-  const input = parseBody(await readBody(request))
-  if (!input) throw new HttpError(400, "Request body must be a JSON object")
-  if (typeof input.model !== "string" || input.model.trim().length === 0) {
-    throw new HttpError(400, "model is required")
-  }
-  if (!Array.isArray(input.messages)) {
-    throw new HttpError(400, "messages must be an array")
-  }
-  const model = await resolveModel(input.model)
-  const converted = anthropicToCommandCode({ ...input, model })
-  await runCommandCode(
-    request,
-    response,
-    converted,
-    "anthropic",
-    model,
-    input.stream === true,
-    converted.toolRegistry,
-    input,
-  )
-}
-
-async function proxyResponses(request, response) {
-  const input = parseBody(await readBody(request))
-  if (!input) throw new HttpError(400, "Request body must be a JSON object")
-  if (typeof input.model !== "string" || input.model.trim().length === 0) {
-    throw new HttpError(400, "model is required")
-  }
-  if (typeof input.input !== "string" && !Array.isArray(input.input)) {
-    throw new HttpError(400, "input must be a string or an array")
-  }
-  const model = await resolveModel(input.model)
-  const converted = responsesToCommandCode({ ...input, model })
-  await runCommandCode(
-    request,
-    response,
-    converted,
-    "responses",
-    model,
-    input.stream === true,
-    converted.toolRegistry,
-    input,
-  )
-}
-
-async function runCommandCode(request, response, input, protocol, model, wantsStream, toolRegistry, requestInput) {
-  const clientThreadId = threadIdFrom(request.headers, requestInput)
-  const threadId = resolveThreadId(clientThreadId)
-  const stats = createRequestStats(protocol, model, wantsStream)
-  const debug = createDebugLog(protocol, request)
-  stats.debug = debug
-  if (debug) response.on("close", () => setImmediate(() => finishDebug(debug, stats)))
-  const controller = new AbortController()
-  response.on("close", () => controller.abort())
-  const headers = buildHeaders(threadId)
-  const upstreamBody = buildGenerateBody(input, threadId)
-  const context = applyContextGuard(upstreamBody)
-  debug?.write("client_request", { protocol, headers: redactedHeaders(request.headers), body: requestInput })
-  debug?.write("upstream_request", { threadId, headers: redactedHeaders(headers), body: upstreamBody, context })
-
+async function fetchCommandCode(body, headers, controller, debug) {
+  const headerTimeout = new AbortController()
+  const timer =
+    STREAM_IDLE_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+          const error = new Error(`upstream response headers idle for ${STREAM_IDLE_TIMEOUT_MS}ms`)
+          error.name = "TimeoutError"
+          headerTimeout.abort(error)
+        }, STREAM_IDLE_TIMEOUT_MS)
+      : undefined
   const upstream = await fetch(`${BASE_URL}/alpha/generate`, {
     method: "POST",
     headers,
-    body: JSON.stringify(upstreamBody),
-    signal: controller.signal,
-  }).catch((error) => {
-    debug?.write("fetch_error", { message: error instanceof Error ? error.message : String(error) })
-    return { error }
+    body: JSON.stringify(body),
+    signal: timer ? AbortSignal.any([controller.signal, headerTimeout.signal]) : controller.signal,
   })
-
-  if (!("error" in upstream)) {
-    debug?.write("upstream_response", {
-      status: upstream.status,
-      headers: redactedHeaders(Object.fromEntries(upstream.headers)),
-    })
-  }
-
+    .catch((error) => ({ error }))
+    .finally(() => clearTimeout(timer))
   if ("error" in upstream) {
-    if (upstream.error?.name === "AbortError") {
-      stats.error = "aborted"
-      logRequest(stats)
-      response.end()
-      return
-    }
-    stats.error = upstream.error instanceof Error ? upstream.error.message : String(upstream.error)
-    logRequest(stats)
-    throw new HttpError(502, upstream.error instanceof Error ? upstream.error.message : String(upstream.error))
+    debug?.write("fetch_error", { message: upstream.error instanceof Error ? upstream.error.message : String(upstream.error) })
+    return upstream
   }
+  debug?.write("upstream_response", {
+    status: upstream.status,
+    headers: redactedHeaders(Object.fromEntries(upstream.headers)),
+  })
+  return { upstream }
+}
 
-  stats.status = upstream.status
-  if (!upstream.ok) {
-    const text = await upstream.text()
-    const parsed = parseJson(text)
-    const message =
-      ((typeof parsed?.error === "string" ? parsed.error : parsed?.error?.message) ??
-        parsed?.message ??
-        text) ||
-      "Command Code returned an error"
-    stats.error = message
-    logRequest(stats)
-    if (protocol === "anthropic") {
-      json(response, upstream.status, { type: "error", error: { type: "proxy_error", message } })
-    } else {
-      json(response, upstream.status, { error: { type: "upstream_error", message } })
-    }
-    return
-  }
-
-  if (wantsStream) {
-    response.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    })
-    try {
-      const result =
-        protocol === "anthropic"
-          ? await streamAnthropic(upstream, response, model, toolRegistry, stats)
-          : await streamResponses(upstream, response, model, toolRegistry, stats)
-      stats.usage = result?.usage
-      stats.error = result?.error
-      logRequest(stats)
-      if (!result?.finished || result?.error) {
-        logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
-        rotateThreadId(clientThreadId)
-      }
-    } catch (error) {
-      logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
-      rotateThreadId(clientThreadId)
-      stats.error = error?.name === "AbortError" ? "aborted" : error instanceof Error ? error.message : String(error)
-      logRequest(stats)
-      if (error?.name !== "AbortError") throw error
-    }
-    return
-  }
-
-  try {
-    const result = await collectCommandCode(upstream, stats)
-    if (result.error) {
-      stats.error = result.error
-      logRequest(stats)
-      throw new HttpError(errorStatus(result.error), result.error)
-    }
-    stats.usage = result.usage
-    logRequest(stats)
-    if (protocol === "anthropic") json(response, 200, commandCodeToAnthropic(result, model, toolRegistry))
-    else json(response, 200, commandCodeToResponses(result, model, toolRegistry))
-  } catch (error) {
-    logWarn(`request shape: ${JSON.stringify(requestShape(upstreamBody))}`)
-    rotateThreadId(clientThreadId)
-    if (!stats.error) {
-      stats.error = error instanceof Error ? error.message : String(error)
-      logRequest(stats)
-    }
-    throw error
+async function readUpstreamFailure(upstream) {
+  const text = await upstream.text()
+  const parsed = parseJson(text)
+  const message =
+    ((typeof parsed?.error === "string" ? parsed.error : parsed?.error?.message) ?? parsed?.message ?? text) ||
+    `Command Code request failed (${upstream.status})`
+  return {
+    message,
+    type: parsed?.error?.type ?? "upstream_error",
+    code: parsed?.error?.code,
   }
 }
 
@@ -845,306 +774,6 @@ function applyContextGuard(body) {
     logWarn(`context guard: request is ${before} bytes and no historical images were removed`)
   }
   return { before, after, ...stripped }
-}
-
-function anthropicToCommandCode(input) {
-  const system = []
-  let directiveEffort
-  const systemText = readThinkDirective(anthropicText(input.system), (effort) => (directiveEffort = effort))
-  if (systemText) system.push({ type: "text", text: systemText })
-  const messages = []
-  const toolNames = new Map()
-  const toolRegistry = buildToolRegistry(input.tools)
-  const source = Array.isArray(input.messages) ? input.messages : []
-  const lastUserIndex = lastMessageIndex(source, "user")
-
-  for (const [messageIndex, message] of source.entries()) {
-    if (!message || typeof message !== "object") continue
-    if (message.role === "assistant") {
-      const content = []
-      for (const [blockIndex, block] of anthropicBlocks(message.content).entries()) {
-        if (block.type === "text" && typeof block.text === "string") content.push({ type: "text", text: block.text })
-        if (block.type === "thinking" && typeof block.thinking === "string") {
-          content.push({ type: "reasoning", text: stripThinkControl(block.thinking) })
-        }
-        if (block.type === "redacted_thinking") content.push({ type: "reasoning", text: "" })
-        if (block.type === "tool_use") {
-          const id = block.id ?? `call_${messageIndex}_${blockIndex}`
-          const name = block.name ?? ""
-          const upstreamName = resolveToolName(toolRegistry, name) || "unknown"
-          toolNames.set(id, upstreamName)
-          content.push({
-            type: "tool-call",
-            toolCallId: id,
-            toolName: upstreamName,
-            input: parseToolArguments(block.input),
-          })
-        }
-      }
-      messages.push(
-        content.length > 0
-          ? { role: "assistant", content }
-          : { role: "assistant", content: [{ type: "text", text: "(previous assistant response was empty)" }] },
-      )
-      continue
-    }
-
-    const parts = []
-    let directiveApplied = false
-    const flush = () => {
-      if (parts.length === 0) return
-      messages.push({ role: "user", content: parts.splice(0) })
-    }
-    for (const block of anthropicBlocks(message.content)) {
-      if (block.type === "tool_result") {
-        flush()
-        messages.push({
-          role: "tool",
-          content: [
-            {
-              type: "tool-result",
-              toolCallId: block.tool_use_id ?? "",
-              toolName: toolNames.get(block.tool_use_id) ?? "unknown",
-              output: { type: "text", value: anthropicText(block.content) },
-            },
-          ],
-        })
-        continue
-      }
-      if (block.type === "text" && typeof block.text === "string") {
-        const text =
-          messageIndex === lastUserIndex && !directiveApplied
-            ? readThinkDirective(block.text, (effort) => (directiveEffort = effort))
-            : block.text
-        directiveApplied = true
-        if (text) parts.push({ type: "text", text })
-        continue
-      }
-      if (block.type === "image") {
-        const url = anthropicImageUrl(block)
-        if (url) parts.push({ type: "image", image: url, mimeType: mimeTypeOf(url) })
-      }
-    }
-    flush()
-  }
-
-  if (system.length === 0) system.push({ type: "text", text: "You are a helpful assistant." })
-
-  let tools = toolRegistry.tools
-
-  const choice = input.tool_choice
-  if (choice?.type === "none") tools = []
-  else if (choice?.type === "any") {
-    system.push({ type: "text", text: "You must call one of the provided tools for this request." })
-  } else if (choice?.type === "tool" && choice.name) {
-    system.push({
-      type: "text",
-      text: `You must call the tool "${resolveToolName(toolRegistry, choice.name)}" for this request.`,
-    })
-  }
-
-  const maxTokens = Number(input.max_tokens)
-  return {
-    model: input.model,
-    system,
-    messages: repairToolCallHistory(messages),
-    tools,
-    maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.min(64000, Math.floor(maxTokens)) : 64000,
-    temperature: typeof input.temperature === "number" ? input.temperature : undefined,
-    topP: typeof input.top_p === "number" ? input.top_p : undefined,
-    stop: input.stop_sequences,
-    reasoningEffort:
-      directiveEffort ??
-      (input.thinking?.type === "enabled" ? "high" : input.thinking?.type === "disabled" ? "off" : undefined),
-    toolRegistry,
-  }
-}
-
-function responsesToCommandCode(input) {
-  const system = []
-  if (typeof input.instructions === "string" && input.instructions.trim()) {
-    system.push({ type: "text", text: input.instructions })
-  }
-  const messages = []
-  const toolRegistry = buildToolRegistry(input.tools)
-  const callNames = new Map()
-  const source =
-    typeof input.input === "string"
-      ? [{ type: "message", role: "user", content: input.input }]
-      : Array.isArray(input.input)
-        ? input.input
-        : []
-  const lastUserIndex = lastMessageIndex(source, "user")
-  let pendingReasoning = ""
-  let pendingReasoningSeen = false
-  let directiveEffort
-
-  const takeReasoning = () => {
-    if (!pendingReasoningSeen) return undefined
-    const reasoning = { type: "reasoning", text: pendingReasoning }
-    pendingReasoning = ""
-    pendingReasoningSeen = false
-    return reasoning
-  }
-
-  for (const [itemIndex, item] of source.entries()) {
-    if (typeof item === "string") {
-      const text = itemIndex === lastUserIndex ? readThinkDirective(item, (effort) => (directiveEffort = effort)) : item
-      if (text) messages.push({ role: "user", content: [{ type: "text", text }] })
-      continue
-    }
-    if (!item || typeof item !== "object") continue
-
-    if (item.type === "reasoning") {
-      pendingReasoning += stripThinkControl(decodeReasoning(item.encrypted_content) ?? reasoningTextFromItem(item))
-      pendingReasoningSeen = true
-      continue
-    }
-
-    if (item.type === "message") {
-      const role = item.role ?? "user"
-      const content = responsesContentToCommandCode(item.content)
-      if (role === "system" || role === "developer") {
-        system.push(
-          ...content.flatMap((part, index) => {
-            if (part.type !== "text") return [part]
-            const text =
-              index === 0 ? readThinkDirective(part.text, (effort) => (directiveEffort = effort)) : part.text
-            return text ? [{ ...part, text }] : []
-          }),
-        )
-        continue
-      }
-      if (role === "assistant") {
-        const reasoning = takeReasoning()
-        const parts = reasoning ? [reasoning, ...content] : content
-        messages.push(
-          parts.length > 0
-            ? { role: "assistant", content: parts }
-            : { role: "assistant", content: [{ type: "text", text: "(previous assistant response was empty)" }] },
-        )
-        continue
-      }
-      const reasoning = takeReasoning()
-      if (reasoning) messages.push({ role: "assistant", content: [reasoning] })
-      if (itemIndex === lastUserIndex) {
-        const parts = stripThinkFromParts(content, (effort) => (directiveEffort = effort))
-        if (parts.length > 0) messages.push({ role: "user", content: parts })
-        continue
-      }
-      if (content.length > 0) messages.push({ role: "user", content })
-      continue
-    }
-
-    if (item.type === "function_call") {
-      const id = item.call_id ?? item.id ?? `call_${itemIndex}`
-      const toolName = resolveToolName(toolRegistry, item.name ?? "", item.namespace) || "unknown"
-      callNames.set(id, toolName)
-      const reasoning = takeReasoning()
-      messages.push({
-        role: "assistant",
-        content: [
-          ...(reasoning ? [reasoning] : []),
-          {
-            type: "tool-call",
-            toolCallId: id,
-            toolName,
-            input: parseToolArguments(item.arguments),
-          },
-        ],
-      })
-      continue
-    }
-
-    if (item.type === "custom_tool_call") {
-      const id = item.call_id ?? item.id ?? `call_${itemIndex}`
-      const toolName = resolveToolName(toolRegistry, item.name ?? "", item.namespace) || "unknown"
-      callNames.set(id, toolName)
-      const reasoning = takeReasoning()
-      messages.push({
-        role: "assistant",
-        content: [
-          ...(reasoning ? [reasoning] : []),
-          {
-            type: "tool-call",
-            toolCallId: id,
-            toolName,
-            input: { input: customToolInput(item.input) },
-          },
-        ],
-      })
-      continue
-    }
-
-    if (
-      item.type === "function_call_output" ||
-      item.type === "custom_tool_call_output" ||
-      item.type === "tool_result"
-    ) {
-      const id = item.call_id ?? item.tool_use_id ?? item.id ?? ""
-      messages.push({
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: id,
-            toolName:
-              (callNames.get(id) ?? (item.name ? resolveToolName(toolRegistry, item.name, item.namespace) : "")) ||
-              "unknown",
-            output: { type: "text", value: outputText(item.output) },
-          },
-        ],
-      })
-    }
-  }
-
-  const trailingReasoning = takeReasoning()
-  if (trailingReasoning) messages.push({ role: "assistant", content: [trailingReasoning] })
-  if (system.length === 0) system.push({ type: "text", text: "You are a helpful assistant." })
-
-  let tools = toolRegistry.tools
-
-  const choice = input.tool_choice
-  if (choice === "none") tools = []
-  else if (choice === "required") {
-    system.push({ type: "text", text: "You must call one of the provided tools for this request." })
-  } else if (
-    choice &&
-    typeof choice === "object" &&
-    (choice.type === "function" || choice.type === "custom") &&
-    choice.name
-  ) {
-    system.push({
-      type: "text",
-      text: `You must call the tool "${resolveToolName(toolRegistry, choice.name, choice.namespace)}" for this request.`,
-    })
-  } else if (
-    choice &&
-    typeof choice === "object" &&
-    choice.type === "allowed_tools" &&
-    Array.isArray(choice.tools)
-  ) {
-    const allowed = new Set(
-      choice.tools.map((tool) => resolveToolName(toolRegistry, tool.name, tool.namespace)),
-    )
-    tools = tools.filter((tool) => allowed.has(tool.name))
-    if (choice.mode === "required") {
-      system.push({ type: "text", text: "You must call one of the provided tools for this request." })
-    }
-  }
-
-  const maxTokens = Number(input.max_output_tokens)
-  return {
-    model: input.model,
-    system,
-    messages: repairToolCallHistory(messages),
-    tools,
-    maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.min(64000, Math.floor(maxTokens)) : 64000,
-    temperature: typeof input.temperature === "number" ? input.temperature : undefined,
-    topP: typeof input.top_p === "number" ? input.top_p : undefined,
-    reasoningEffort: directiveEffort ?? normalizeReasoningEffort(input.reasoning?.effort, input.model),
-    toolRegistry,
-  }
 }
 
 function buildToolRegistry(tools) {
@@ -1284,18 +913,6 @@ function resolveToolName(registry, name, namespace) {
   return sanitizeToolName(raw)
 }
 
-function customToolInput(value) {
-  if (typeof value === "string") return value
-  if (value && typeof value === "object") {
-    if (typeof value.input === "string") return value.input
-    if (typeof value.patch === "string") return value.patch
-    if (typeof value.content === "string") return value.content
-    const strings = Object.values(value).filter((entry) => typeof entry === "string")
-    if (strings.length === 1) return strings[0]
-  }
-  return JSON.stringify(value ?? "")
-}
-
 function coerceToolInput(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) return value
   if (Array.isArray(value) && value.length === 1 && value[0] && typeof value[0] === "object") return value[0]
@@ -1307,26 +924,6 @@ function parseToolArguments(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) return value
   if (typeof value === "string" && value.trim()) return parseJson(value) ?? {}
   return {}
-}
-
-function reasoningTextFromItem(item) {
-  return [...(Array.isArray(item.summary) ? item.summary : []), ...(Array.isArray(item.content) ? item.content : [])]
-    .flatMap((part) => (typeof part?.text === "string" ? [part.text] : []))
-    .join("")
-}
-
-function encodeReasoning(text) {
-  if (!text) return undefined
-  return REASONING_PREFIX + zlib.gzipSync(Buffer.from(text, "utf8")).toString("base64url")
-}
-
-function decodeReasoning(value) {
-  if (typeof value !== "string" || !value.startsWith(REASONING_PREFIX)) return undefined
-  try {
-    return zlib.gunzipSync(Buffer.from(value.slice(REASONING_PREFIX.length), "base64url")).toString("utf8")
-  } catch {
-    return undefined
-  }
 }
 
 function lastMessageIndex(messages, role) {
@@ -1350,38 +947,6 @@ function readThinkDirective(text, onEffort) {
 
 function stripThinkControl(text) {
   return String(text ?? "").replace(/^\s*\/(?:no_think|think)(?=$|\s|[.,;:!?])\s*/i, "")
-}
-
-function stripThinkFromParts(parts, onEffort) {
-  let applied = false
-  return parts.flatMap((part) => {
-    if (part.type !== "text" || applied) return [part]
-    applied = true
-    const text = readThinkDirective(part.text, onEffort)
-    return text ? [{ ...part, text }] : []
-  })
-}
-
-function outputText(value) {
-  if (typeof value === "string") return value
-  if (Array.isArray(value)) {
-    return value
-      .flatMap((part) => {
-        if (typeof part === "string") return [part]
-        if (part?.type === "input_text" || part?.type === "output_text" || part?.type === "text") {
-          return typeof part.text === "string" ? [part.text] : []
-        }
-        if (part?.type === "input_image" || part?.type === "image_url") return ["[image]"]
-        return []
-      })
-      .join("\n")
-  }
-  if (value && typeof value === "object") {
-    if (typeof value.text === "string") return value.text
-    if (typeof value.content === "string") return value.content
-    return JSON.stringify(value)
-  }
-  return String(value ?? "")
 }
 
 class ControlTextFilter {
@@ -1432,52 +997,6 @@ class ControlTextFilter {
   }
 }
 
-function anthropicBlocks(content) {
-  if (typeof content === "string") return [{ type: "text", text: content }]
-  if (Array.isArray(content)) return content.filter((block) => block && typeof block === "object")
-  return []
-}
-
-function anthropicText(content) {
-  if (typeof content === "string") return content
-  if (!Array.isArray(content)) return ""
-  return content
-    .flatMap((block) => {
-      if (typeof block === "string") return [block]
-      if (block?.type === "text" && typeof block.text === "string") return [block.text]
-      return []
-    })
-    .join("")
-}
-
-function anthropicImageUrl(block) {
-  const source = block.source
-  if (!source || typeof source !== "object") return undefined
-  if (source.type === "base64" && source.data && source.media_type) {
-    return `data:${source.media_type};base64,${source.data}`
-  }
-  if (source.type === "url" && source.url) return source.url
-  return undefined
-}
-
-function responsesContentToCommandCode(content) {
-  if (typeof content === "string") return [{ type: "text", text: content }]
-  if (!Array.isArray(content)) return []
-  return content.flatMap((part) => {
-    if (typeof part === "string") return [{ type: "text", text: part }]
-    if (!part || typeof part !== "object") return []
-    if (part.type === "input_text" || part.type === "output_text" || part.type === "text") {
-      return typeof part.text === "string" ? [{ type: "text", text: part.text }] : []
-    }
-    if (part.type === "input_image") {
-      const raw = part.image_url ?? part.url
-      const url = typeof raw === "string" ? raw : raw?.url
-      return typeof url === "string" ? [{ type: "image", image: url, mimeType: mimeTypeOf(url) }] : []
-    }
-    return []
-  })
-}
-
 function buildGenerateBody(input, threadId) {
   const reasoningEffort = normalizeReasoningEffort(input.reasoningEffort, input.model)
   return {
@@ -1525,7 +1044,7 @@ function openAIToCommandCode(input) {
   for (const [messageIndex, message] of source.entries()) {
     if (!message || typeof message !== "object") continue
     if (message.role === "system" || message.role === "developer") {
-      const text = readThinkDirective(contentText(message.content), (effort) => (directiveEffort = effort))
+      const text = contentText(message.content)
       if (text) system.push({ type: "text", text })
       continue
     }
@@ -1562,11 +1081,13 @@ function openAIToCommandCode(input) {
           input: parseToolArguments(call.function?.arguments),
         })
       }
-      messages.push(
+      const assistantContent =
         content.length > 0
-          ? { role: "assistant", content }
-          : { role: "assistant", content: [{ type: "text", text: "(previous assistant response was empty)" }] },
-      )
+          ? content
+          : EMPTY_ASSISTANT_PLACEHOLDER
+            ? [{ type: "text", text: "(previous assistant response was empty)" }]
+            : []
+      messages.push({ role: "assistant", content: assistantContent })
       continue
     }
     if (message.role === "tool") {
@@ -1586,23 +1107,23 @@ function openAIToCommandCode(input) {
 
     const content = []
     if (typeof message.content === "string") {
-      const text =
-        messageIndex === lastUserIndex
-          ? readThinkDirective(message.content, (effort) => (directiveEffort = effort))
-          : message.content
+      const text = readThinkDirective(message.content, (effort) => {
+        if (messageIndex === lastUserIndex) directiveEffort = effort
+      })
       if (text) content.push({ type: "text", text })
     } else if (Array.isArray(message.content)) {
-      let directiveApplied = false
+      let directiveFound = false
       for (const part of message.content) {
         if (
           (part?.type === "text" || part?.type === "input_text" || part?.type === "output_text") &&
           typeof part.text === "string"
         ) {
-          const text =
-            messageIndex === lastUserIndex && !directiveApplied
-              ? readThinkDirective(part.text, (effort) => (directiveEffort = effort))
-              : part.text
-          directiveApplied = true
+          let partEffort
+          const text = readThinkDirective(part.text, (effort) => (partEffort = effort))
+          if (messageIndex === lastUserIndex && !directiveFound && partEffort !== undefined) {
+            directiveEffort = partEffort
+            directiveFound = true
+          }
           if (text) content.push({ type: "text", text })
         }
         if (part?.type === "image_url") {
@@ -1628,6 +1149,20 @@ function openAIToCommandCode(input) {
     })
   } else if (choice === "required") {
     system.push({ type: "text", text: "You must call one of the provided tools for this request." })
+  }
+  if (input.parallel_tool_calls === false) {
+    system.push({
+      type: "text",
+      text: "Call at most one tool at a time. Wait for that tool's result before issuing another tool call.",
+    })
+  }
+  if (input.response_format?.type === "json_object") {
+    system.push({ type: "text", text: "Return only one valid JSON object. Do not wrap it in Markdown or add prose." })
+  } else if (input.response_format?.type === "json_schema") {
+    system.push({
+      type: "text",
+      text: `Return only JSON that conforms to this schema. Do not wrap it in Markdown or add prose:\n${JSON.stringify(input.response_format.json_schema ?? {})}`,
+    })
   }
 
   const maxTokens = Number(input.max_completion_tokens ?? input.max_tokens)
@@ -1796,13 +1331,20 @@ async function streamOpenAI(upstream, response, options) {
   const id = `chatcmpl-${randomID()}`
   const created = Math.floor(Date.now() / 1000)
   let toolIndex = 0
+  let started = false
+  let terminal = false
+  let hadOutput = false
   let finished = false
+  let finishReason = "stop"
   let usage
   let error
+  let backpressured = false
 
-  const write = (value) => {
+  const writeData = (value) => {
     if (response.writableEnded || response.destroyed) return
-    response.write(`data: ${JSON.stringify(value)}\n\n`)
+    if (!response.write(`data: ${typeof value === "string" ? value : JSON.stringify(value)}\n\n`)) {
+      backpressured = true
+    }
   }
   const chunk = (delta, finishReason) => ({
     id,
@@ -1811,24 +1353,72 @@ async function streamOpenAI(upstream, response, options) {
     model: options.model,
     choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
   })
+  const waitForDrain = () => {
+    if (!backpressured || response.writableEnded || response.destroyed) {
+      backpressured = false
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      const finish = () => {
+        response.off("drain", finish)
+        response.off("close", finish)
+        backpressured = false
+        resolve()
+      }
+      response.once("drain", finish)
+      response.once("close", finish)
+    })
+  }
+  const ensureStarted = () => {
+    if (started || response.writableEnded || response.destroyed) return
+    started = true
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    })
+    writeData(chunk({ role: "assistant" }, null))
+  }
+  const finalize = (reason) => {
+    if (terminal) return
+    ensureStarted()
+    writeData(chunk({}, reason))
+    if (options.includeUsage && usage) {
+      writeData({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: options.model,
+        choices: [],
+        usage: openAIUsage(usage),
+      })
+    }
+    writeData("[DONE]")
+    terminal = true
+  }
 
-  write(chunk({ role: "assistant" }, null))
   const result = await readCommandCode(upstream, (event) => {
-    if (finished) return
+    if (terminal) return
     if (event.type === "text") {
+      hadOutput = true
       markOutput(options.stats)
-      write(chunk({ content: event.text }, null))
+      ensureStarted()
+      writeData(chunk({ content: event.text }, null))
       return
     }
     if (event.type === "reasoning") {
+      hadOutput = true
       markOutput(options.stats)
-      write(chunk({ reasoning_content: event.text }, null))
+      ensureStarted()
+      writeData(chunk({ reasoning_content: event.text }, null))
       return
     }
     if (event.type === "tool") {
+      hadOutput = true
       markOutput(options.stats)
       const name = options.toolRegistry?.byName.get(event.name)?.name ?? event.name
-      write(
+      ensureStarted()
+      writeData(
         chunk(
           {
             tool_calls: [
@@ -1850,36 +1440,27 @@ async function streamOpenAI(upstream, response, options) {
     }
     if (event.type === "finish") {
       finished = true
+      finishReason = event.reason ?? "stop"
       usage = event.usage
-      write(chunk({}, event.reason))
-      if (options.includeUsage) {
-        write({
-          id,
-          object: "chat.completion.chunk",
-          created,
-          model: options.model,
-          choices: [],
-          usage: openAIUsage(event.usage),
-        })
-      }
-      response.write("data: [DONE]\n\n")
       return
     }
     if (event.type === "error") {
-      finished = true
       error = event.message
       return
     }
-  }, options.stats?.debug)
+  }, options.stats?.debug, { idleTimeoutMs: STREAM_IDLE_TIMEOUT_MS, beforeRead: waitForDrain })
 
-  const completed = finished && !error
+  hadOutput ||= result.hadOutput
+  const completed = finished && result.finished && !error && !result.error
   if (!completed) {
     error ??= result.error ?? result.readError ?? "Command Code stream ended before completion"
-    write(chunk({}, "stop"))
-    response.write("data: [DONE]\n\n")
   }
-  response.end()
-  return { usage, error, finished: completed }
+  if (hadOutput) finalize(finished && !error ? finishReason : "stop")
+  if (started && !response.writableEnded && !response.destroyed) {
+    await waitForDrain()
+    response.end()
+  }
+  return { usage, error, finished: completed, hadOutput }
 }
 
 async function collectCommandCode(upstream, stats) {
@@ -1888,36 +1469,26 @@ async function collectCommandCode(upstream, stats) {
     text: "",
     reasoning: "",
     tools: [],
-    blocks: [],
     finish: undefined,
     usage: undefined,
     error: undefined,
+    hadOutput: false,
   }
 
-  let lastBlock
-  await readCommandCode(upstream, (event) => {
+  const read = await readCommandCode(upstream, (event) => {
     if (event.type === "text") {
+      result.hadOutput = true
       markOutput(stats)
-      if (lastBlock?.type !== "text") {
-        lastBlock = { type: "text", text: "" }
-        result.blocks.push(lastBlock)
-      }
-      lastBlock.text += event.text
       result.text += event.text
     }
     if (event.type === "reasoning") {
+      result.hadOutput = true
       markOutput(stats)
-      if (lastBlock?.type !== "reasoning") {
-        lastBlock = { type: "reasoning", text: "" }
-        result.blocks.push(lastBlock)
-      }
-      lastBlock.text += event.text
       result.reasoning += event.text
     }
     if (event.type === "tool") {
+      result.hadOutput = true
       markOutput(stats)
-      lastBlock = { type: "tool", tool: event }
-      result.blocks.push(lastBlock)
       result.tools.push(event)
     }
     if (event.type === "finish") {
@@ -1927,8 +1498,18 @@ async function collectCommandCode(upstream, stats) {
     if (event.type === "error") result.error = event.message
   }, stats?.debug)
 
-  if (result.error) throw new HttpError(errorStatus(result.error), result.error)
-  if (result.finish === undefined) throw new HttpError(502, "Command Code stream ended before completion")
+  result.hadOutput ||= read.hadOutput
+  if (result.error || read.error) {
+    const error = new HttpError(errorStatus(result.error ?? read.error), result.error ?? read.error)
+    error.hadOutput = result.hadOutput
+    throw error
+  }
+  if (result.finish === undefined) {
+    const message = read.readError ?? "Command Code stream ended before completion"
+    const error = new HttpError(502, message)
+    error.hadOutput = result.hadOutput
+    throw error
+  }
   return result
 }
 
@@ -1950,7 +1531,7 @@ async function collectOpenAI(upstream, model, toolRegistry, stats) {
     }))
   }
 
-  return {
+  const body = {
     id: `chatcmpl-${randomID()}`,
     object: "chat.completion",
     created: result.created,
@@ -1965,561 +1546,17 @@ async function collectOpenAI(upstream, model, toolRegistry, stats) {
     ],
     ...(result.usage ? { usage: openAIUsage(result.usage) } : {}),
   }
+  return { body, hadOutput: result.hadOutput, usage: result.usage }
 }
 
-function commandCodeToAnthropic(result, model, toolRegistry) {
-  const content = []
-  const blocks = result.blocks?.length
-    ? result.blocks
-    : [
-        ...(result.reasoning ? [{ type: "reasoning", text: result.reasoning }] : []),
-        ...(result.text ? [{ type: "text", text: result.text }] : []),
-        ...result.tools.map((tool) => ({ type: "tool", tool })),
-      ]
-  for (const block of blocks) {
-    if (block.type === "reasoning") {
-      content.push({
-        type: "thinking",
-        thinking: block.text,
-        signature: encodeReasoning(block.text) ?? "",
-      })
-      continue
-    }
-    if (block.type === "text") {
-      content.push({ type: "text", text: block.text })
-      continue
-    }
-    const tool = block.tool
-    content.push({
-      type: "tool_use",
-      id: tool.id || `toolu_${randomID()}`,
-      name: toolRegistry?.byName.get(tool.name)?.name ?? tool.name,
-      input: parseToolArguments(tool.input),
-    })
-  }
-  if (content.length === 0) content.push({ type: "text", text: "" })
-
-  return {
-    id: `msg_${randomID()}`,
-    type: "message",
-    role: "assistant",
-    model,
-    content,
-    stop_reason: anthropicStopReason(result.finish),
-    stop_sequence: null,
-    usage: anthropicUsageFromCommandCode(result.usage),
-  }
-}
-
-function anthropicStopReason(reason) {
-  if (reason === "tool_calls") return "tool_use"
-  if (reason === "length") return "max_tokens"
-  if (reason === "content_filter") return "refusal"
-  return "end_turn"
-}
-
-function anthropicUsageFromCommandCode(usage) {
-  const result = {
-    input_tokens: usage?.inputTokens ?? 0,
-    output_tokens: usage?.outputTokens ?? 0,
-  }
-  const cached = usage?.inputTokenDetails?.cacheReadTokens
-  if (cached) result.cache_read_input_tokens = cached
-  return result
-}
-
-function commandCodeToResponses(result, model, toolRegistry) {
-  const output = []
-  const blocks = result.blocks?.length
-    ? result.blocks
-    : [
-        ...(result.reasoning ? [{ type: "reasoning", text: result.reasoning }] : []),
-        ...(result.text ? [{ type: "text", text: result.text }] : []),
-        ...result.tools.map((tool) => ({ type: "tool", tool })),
-      ]
-  for (const block of blocks) {
-    if (block.type === "reasoning") {
-      output.push({
-        type: "reasoning",
-        id: `rs_${randomID()}`,
-        summary: [{ type: "summary_text", text: block.text }],
-        encrypted_content: encodeReasoning(block.text),
-      })
-      continue
-    }
-    if (block.type === "text") {
-      output.push({
-        type: "message",
-        id: `msg_${randomID()}`,
-        status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text: block.text, annotations: [] }],
-      })
-      continue
-    }
-    const tool = block.tool
-    const descriptor = toolRegistry?.byName.get(tool.name)
-    if (descriptor?.kind === "custom") {
-      output.push({
-        type: "custom_tool_call",
-        id: `ctc_${randomID()}`,
-        status: "completed",
-        call_id: tool.id || `call_${randomID()}`,
-        name: descriptor.name,
-        ...(descriptor.namespace ? { namespace: descriptor.namespace } : {}),
-        input: customToolInput(tool.input),
-      })
-      continue
-    }
-    output.push({
-      type: "function_call",
-      id: `fc_${randomID()}`,
-      status: "completed",
-      call_id: tool.id || `call_${randomID()}`,
-      name: descriptor?.name ?? tool.name,
-      ...(descriptor?.namespace ? { namespace: descriptor.namespace } : {}),
-      arguments: JSON.stringify(tool.input ?? {}),
-    })
-  }
-
-  const incomplete = result.finish === "length"
-  return {
-    id: `resp_${randomID()}`,
-    object: "response",
-    created_at: result.created,
-    status: incomplete ? "incomplete" : "completed",
-    model,
-    output,
-    usage: responsesUsage(result.usage),
-    error: null,
-    incomplete_details: incomplete ? { reason: "max_output_tokens" } : null,
-  }
-}
-
-function responsesUsage(usage) {
-  const input = usage?.inputTokens ?? 0
-  const output = usage?.outputTokens ?? 0
-  return {
-    input_tokens: input,
-    input_tokens_details: { cached_tokens: usage?.inputTokenDetails?.cacheReadTokens ?? 0 },
-    output_tokens: output,
-    output_tokens_details: { reasoning_tokens: usage?.outputTokenDetails?.reasoningTokens ?? 0 },
-    total_tokens: usage?.totalTokens ?? input + output,
-  }
-}
-
-async function streamAnthropic(upstream, response, model, toolRegistry, stats) {
-  const state = {
-    id: `msg_${randomID()}`,
-    model,
-    next: 0,
-    blocks: [],
-    reasoning: undefined,
-    text: undefined,
-    tools: new Map(),
-    usage: undefined,
-    finish: undefined,
-    failed: false,
-  }
-
-  const emit = (type, data) => {
-    if (response.writableEnded || response.destroyed) return
-    response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
-  }
-  const ensureReasoning = () => {
-    if (state.reasoning) return state.reasoning
-    state.reasoning = { kind: "reasoning", index: state.next++, text: "" }
-    state.blocks.push(state.reasoning)
-    emit("content_block_start", {
-      index: state.reasoning.index,
-      content_block: { type: "thinking", thinking: "" },
-    })
-    return state.reasoning
-  }
-  const ensureText = () => {
-    if (state.text) return state.text
-    state.text = { kind: "text", index: state.next++, text: "" }
-    state.blocks.push(state.text)
-    emit("content_block_start", { index: state.text.index, content_block: { type: "text", text: "" } })
-    return state.text
-  }
-  const ensureTool = (tool) => {
-    const key = tool.id || tool.name
-    if (state.tools.has(key)) return state.tools.get(key)
-    const descriptor = toolRegistry?.byName.get(tool.name)
-    const block = {
-      kind: "tool",
-      index: state.next++,
-      id: tool.id || `toolu_${randomID()}`,
-      name: descriptor?.name ?? tool.name,
-    }
-    state.tools.set(key, block)
-    state.blocks.push(block)
-    emit("content_block_start", {
-      index: block.index,
-      content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
-    })
-    return block
-  }
-
-  emit("message_start", {
-    message: {
-      id: state.id,
-      type: "message",
-      role: "assistant",
-      content: [],
-      model,
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
-    },
-  })
-  emit("ping", {})
-
-  const readResult = await readCommandCode(upstream, (event) => {
-    if (state.finish || state.failed) return
-    if (event.type === "text") {
-      markOutput(stats)
-      const block = ensureText()
-      block.text += event.text
-      emit("content_block_delta", { index: block.index, delta: { type: "text_delta", text: event.text } })
-      return
-    }
-    if (event.type === "reasoning") {
-      markOutput(stats)
-      const block = ensureReasoning()
-      block.text += event.text
-      emit("content_block_delta", {
-        index: block.index,
-        delta: { type: "thinking_delta", thinking: event.text },
-      })
-      return
-    }
-    if (event.type === "tool") {
-      markOutput(stats)
-      const block = ensureTool(event)
-      emit("content_block_delta", {
-        index: block.index,
-        delta: { type: "input_json_delta", partial_json: JSON.stringify(event.input ?? {}) },
-      })
-      state.text = undefined
-      state.reasoning = undefined
-      return
-    }
-    if (event.type === "finish") {
-      state.finish = event.reason
-      state.usage = event.usage
-      return
-    }
-    if (event.type === "error") {
-      state.failed = true
-      emit("error", { error: { type: "upstream_error", message: event.message } })
-    }
-  }, stats?.debug)
-
-  if (state.failed) {
-    response.end()
-    return { usage: state.usage, error: state.failed, finished: false }
-  }
-  const truncated = !state.finish
-  if (truncated) state.finish = "stop"
-
-  const blocks = [...state.blocks]
-  blocks.sort((left, right) => left.index - right.index)
-  if (blocks.length === 0) {
-    emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } })
-    emit("content_block_stop", { index: 0 })
-  } else {
-    for (const block of blocks) {
-      if (block.kind === "reasoning") {
-        const text = block.text ?? ""
-        emit("content_block_delta", {
-          index: block.index,
-          delta: { type: "signature_delta", signature: encodeReasoning(text) ?? "" },
-        })
-      }
-      emit("content_block_stop", { index: block.index })
-    }
-  }
-
-  emit("message_delta", {
-    delta: { stop_reason: anthropicStopReason(state.finish), stop_sequence: null },
-    usage: { output_tokens: state.usage?.outputTokens ?? 0 },
-  })
-  emit("message_stop", {})
-  response.end()
-  return {
-    usage: state.usage,
-    error: truncated ? (readResult.readError ?? "Command Code stream ended before completion") : undefined,
-    finished: !truncated,
-  }
-}
-
-async function streamResponses(upstream, response, model, toolRegistry, stats) {
-  const state = {
-    id: `resp_${randomID()}`,
-    created: Math.floor(Date.now() / 1000),
-    model,
-    sequence: 0,
-    next: 0,
-    blocks: [],
-    reasoning: undefined,
-    text: undefined,
-    tools: new Map(),
-    usage: undefined,
-    finish: undefined,
-    failed: false,
-  }
-
-  const responseObject = (status, output) => ({
-    id: state.id,
-    object: "response",
-    created_at: state.created,
-    status,
-    model,
-    output,
-    usage: responsesUsage(state.usage),
-    error: null,
-    incomplete_details: status === "incomplete" ? { reason: "max_output_tokens" } : null,
-  })
-  const emit = (type, data) => {
-    if (response.writableEnded || response.destroyed) return
-    response.write(
-      `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: state.sequence++, ...data })}\n\n`,
-    )
-  }
-  const ensureReasoning = () => {
-    if (state.reasoning) return state.reasoning
-    state.reasoning = { kind: "reasoning", id: `rs_${randomID()}`, index: state.next++, text: "" }
-    state.blocks.push(state.reasoning)
-    emit("response.output_item.added", {
-      output_index: state.reasoning.index,
-      item: { type: "reasoning", id: state.reasoning.id, summary: [] },
-    })
-    return state.reasoning
-  }
-  const ensureText = () => {
-    if (state.text) return state.text
-    state.text = { kind: "text", id: `msg_${randomID()}`, index: state.next++, text: "" }
-    state.blocks.push(state.text)
-    emit("response.output_item.added", {
-      output_index: state.text.index,
-      item: { type: "message", id: state.text.id, status: "in_progress", role: "assistant", content: [] },
-    })
-    return state.text
-  }
-  const ensureTool = (tool) => {
-    const key = tool.id || tool.name
-    if (state.tools.has(key)) return state.tools.get(key)
-    const descriptor = toolRegistry?.byName.get(tool.name)
-    const custom = descriptor?.kind === "custom"
-    const block = custom
-      ? {
-          kind: "custom",
-          custom: true,
-          id: `ctc_${randomID()}`,
-          index: state.next++,
-          callID: tool.id || `call_${randomID()}`,
-          name: descriptor.name,
-          namespace: descriptor.namespace,
-          input: customToolInput(tool.input),
-        }
-      : {
-          kind: "function",
-          custom: false,
-          id: `fc_${randomID()}`,
-          index: state.next++,
-          callID: tool.id || `call_${randomID()}`,
-          name: descriptor?.name ?? tool.name,
-          namespace: descriptor?.namespace ?? null,
-          arguments: JSON.stringify(tool.input ?? {}),
-        }
-    state.tools.set(key, block)
-    state.blocks.push(block)
-    emit("response.output_item.added", {
-      output_index: block.index,
-      item: custom
-        ? {
-            type: "custom_tool_call",
-            id: block.id,
-            call_id: block.callID,
-            name: block.name,
-            ...(block.namespace ? { namespace: block.namespace } : {}),
-            input: "",
-            status: "in_progress",
-          }
-        : {
-            type: "function_call",
-            id: block.id,
-            call_id: block.callID,
-            name: block.name,
-            ...(block.namespace ? { namespace: block.namespace } : {}),
-            arguments: "",
-            status: "in_progress",
-          },
-    })
-    emit(custom ? "response.custom_tool_call_input.delta" : "response.function_call_arguments.delta", {
-      item_id: block.id,
-      output_index: block.index,
-      delta: custom ? block.input : block.arguments,
-    })
-    return block
-  }
-
-  emit("response.created", { response: responseObject("in_progress", []) })
-  emit("response.in_progress", { response: responseObject("in_progress", []) })
-
-  const readResult = await readCommandCode(upstream, (event) => {
-    if (state.finish || state.failed) return
-    if (event.type === "text") {
-      markOutput(stats)
-      const item = ensureText()
-      item.text += event.text
-      emit("response.output_text.delta", {
-        item_id: item.id,
-        output_index: item.index,
-        content_index: 0,
-        delta: event.text,
-      })
-      return
-    }
-    if (event.type === "reasoning") {
-      markOutput(stats)
-      const item = ensureReasoning()
-      item.text += event.text
-      emit("response.reasoning_summary_text.delta", {
-        item_id: item.id,
-        output_index: item.index,
-        summary_index: 0,
-        delta: event.text,
-      })
-      return
-    }
-    if (event.type === "tool") {
-      markOutput(stats)
-      ensureTool(event)
-      state.text = undefined
-      state.reasoning = undefined
-      return
-    }
-    if (event.type === "finish") {
-      state.finish = event.reason
-      state.usage = event.usage
-      return
-    }
-    if (event.type === "error") {
-      state.failed = true
-      emit("error", { error: { type: "upstream_error", message: event.message } })
-    }
-  }, stats?.debug)
-
-  if (state.failed) {
-    response.end()
-    return { usage: state.usage, error: state.failed, finished: false }
-  }
-  const truncated = !state.finish
-  if (truncated) state.finish = "stop"
-
-  const items = state.blocks.map((block) => {
-    if (block.kind === "reasoning") {
-      return {
-        index: block.index,
-        item: {
-          type: "reasoning",
-          id: block.id,
-          summary: [{ type: "summary_text", text: block.text }],
-          encrypted_content: encodeReasoning(block.text),
-        },
-        done: {
-          type: "response.reasoning_summary_text.done",
-          data: {
-            item_id: block.id,
-            output_index: block.index,
-            summary_index: 0,
-            text: block.text,
-          },
-        },
-      }
-    }
-    if (block.kind === "text") {
-      return {
-        index: block.index,
-        item: {
-          type: "message",
-          id: block.id,
-          status: "completed",
-          role: "assistant",
-          content: [{ type: "output_text", text: block.text, annotations: [] }],
-        },
-        done: {
-          type: "response.output_text.done",
-          data: {
-            item_id: block.id,
-            output_index: block.index,
-            content_index: 0,
-            text: block.text,
-          },
-        },
-      }
-    }
-    if (block.kind === "custom") {
-      return {
-        index: block.index,
-        item: {
-          type: "custom_tool_call",
-          id: block.id,
-          status: "completed",
-          call_id: block.callID,
-          name: block.name,
-          ...(block.namespace ? { namespace: block.namespace } : {}),
-          input: block.input,
-        },
-        done: {
-          type: "response.custom_tool_call_input.done",
-          data: { item_id: block.id, output_index: block.index, input: block.input },
-        },
-      }
-    }
-    return {
-      index: block.index,
-      item: {
-        type: "function_call",
-        id: block.id,
-        status: "completed",
-        call_id: block.callID,
-        name: block.name,
-        ...(block.namespace ? { namespace: block.namespace } : {}),
-        arguments: block.arguments,
-      },
-      done: {
-        type: "response.function_call_arguments.done",
-        data: { item_id: block.id, output_index: block.index, arguments: block.arguments },
-      },
-    }
-  })
-  items.sort((left, right) => left.index - right.index)
-  for (const item of items) {
-    emit(item.done.type, item.done.data)
-    emit("response.output_item.done", { output_index: item.index, item: item.item })
-  }
-
-  const status = state.finish === "length" ? "incomplete" : "completed"
-  const terminal = status === "incomplete" ? "response.incomplete" : "response.completed"
-  emit(terminal, { response: responseObject(status, items.map((item) => item.item)) })
-  response.end()
-  return {
-    usage: state.usage,
-    error: truncated ? (readResult.readError ?? "Command Code stream ended before completion") : undefined,
-    finished: !truncated,
-  }
-}
-
-async function readCommandCode(upstream, onEvent, debug) {
+async function readCommandCode(upstream, onEvent, debug, options = {}) {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
   const debugStartedAt = Date.now()
   let buffer = ""
   let finished = false
+  let hadOutput = false
+  let terminated = false
   let error
   let readFailure
   let lastFinish
@@ -2530,20 +1567,30 @@ async function readCommandCode(upstream, onEvent, debug) {
   const eventTypes = new Map()
   const textFilter = new ControlTextFilter()
   const reasoningFilter = new ControlTextFilter()
+  const emit = (event) => {
+    if (event.type === "text" || event.type === "reasoning" || event.type === "tool") hadOutput = true
+    onEvent(event)
+  }
+  const stopReading = () => {
+    if (terminated) return
+    terminated = true
+    reader.cancel().catch(() => {})
+  }
 
   const flushFilters = () => {
     const text = textFilter.flush()
-    if (text) onEvent({ type: "text", text })
+    if (text) emit({ type: "text", text })
     const reasoning = reasoningFilter.flush()
-    if (reasoning) onEvent({ type: "reasoning", text: reasoning })
+    if (reasoning) emit({ type: "reasoning", text: reasoning })
   }
   const flushBlock = (filter, type) => {
     const text = filter.flush()
-    if (text) onEvent({ type, text })
+    if (text) emit({ type, text })
     filter.reset()
   }
 
   const consume = (line) => {
+    if (terminated) return
     if (!line.trim()) {
       debug?.write("upstream_blank_line", { offsetMs: Date.now() - debugStartedAt })
       return
@@ -2575,19 +1622,19 @@ async function readCommandCode(upstream, onEvent, debug) {
     }
     if (event.type === "text-delta") {
       const text = textFilter.push(event.text ?? "")
-      if (text) onEvent({ type: "text", text })
+      if (text) emit({ type: "text", text })
       return
     }
     if (event.type === "reasoning-delta") {
       const text = reasoningFilter.push(event.text ?? "")
-      if (text) onEvent({ type: "reasoning", text })
+      if (text) emit({ type: "reasoning", text })
       return
     }
     if (event.type === "tool-call") {
       if (event.providerExecuted === true) return
       flushBlock(textFilter, "text")
       flushBlock(reasoningFilter, "reasoning")
-      onEvent({
+      emit({
         type: "tool",
         id: event.toolCallId ?? "",
         name: event.toolName ?? "",
@@ -2598,17 +1645,19 @@ async function readCommandCode(upstream, onEvent, debug) {
     if (event.type === "finish") {
       flushFilters()
       finished = true
-      onEvent({
+      emit({
         type: "finish",
         reason: normalizeFinishReason(event.finishReason ?? event.rawFinishReason ?? lastFinish?.reason),
         usage: event.totalUsage ?? event.usage ?? lastFinish?.usage,
       })
+      stopReading()
       return
     }
     if (event.type === "abort") {
       flushFilters()
       finished = true
-      onEvent({ type: "finish", reason: "stop", usage: undefined })
+      emit({ type: "finish", reason: "stop", usage: undefined })
+      stopReading()
       return
     }
     if (event.type === "finish-step") {
@@ -2619,14 +1668,17 @@ async function readCommandCode(upstream, onEvent, debug) {
       return
     }
     if (event.type === "error") {
+      flushFilters()
       error = readError(event)
-      onEvent({ type: "error", message: error })
+      emit({ type: "error", message: error })
+      stopReading()
     }
   }
 
   try {
-    while (true) {
-      const { done, value } = await reader.read()
+    while (!terminated) {
+      if (options.beforeRead) await options.beforeRead()
+      const { done, value } = await readStreamChunk(reader, options.idleTimeoutMs)
       if (done) break
       rawBytes += value.byteLength
       debug?.write("upstream_chunk", { offsetMs: Date.now() - debugStartedAt, bytes: value.byteLength })
@@ -2643,11 +1695,12 @@ async function readCommandCode(upstream, onEvent, debug) {
   } catch (caught) {
     if (caught?.name === "AbortError") throw caught
     readFailure = caught instanceof Error ? caught.message : String(caught)
+    stopReading()
   }
   if (!finished) flushFilters()
   if (!finished && lastFinish) {
     finished = true
-    onEvent({ type: "finish", reason: lastFinish.reason, usage: lastFinish.usage })
+    emit({ type: "finish", reason: lastFinish.reason, usage: lastFinish.usage })
   }
 
   if (!finished || error || readFailure) {
@@ -2668,7 +1721,26 @@ async function readCommandCode(upstream, onEvent, debug) {
     unparsed: unparsedLines,
     types: Object.fromEntries(eventTypes),
   })
-  return { finished, error, readError: readFailure }
+  return { finished, error, readError: readFailure, hadOutput }
+}
+
+async function readStreamChunk(reader, timeoutMs) {
+  if (!timeoutMs) return reader.read()
+  let timer
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error(`upstream stream idle for ${timeoutMs}ms`)
+          error.name = "StreamIdleTimeoutError"
+          reject(error)
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function normalizeFinishReason(reason) {
