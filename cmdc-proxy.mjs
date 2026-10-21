@@ -22,8 +22,8 @@ import crypto from "node:crypto"
 
 const CONFIGURED_PORT = Number(process.env.PORT ?? 8787)
 const PORT = Number.isInteger(CONFIGURED_PORT) && CONFIGURED_PORT >= 0 ? CONFIGURED_PORT : 8787
-const CONFIGURED_ATTEMPTS = Number(process.env.PORT_ATTEMPTS ?? 20)
-const PORT_ATTEMPTS = Number.isFinite(CONFIGURED_ATTEMPTS) ? Math.max(1, Math.floor(CONFIGURED_ATTEMPTS)) : 20
+const CONFIGURED_ATTEMPTS = Number(process.env.PORT_ATTEMPTS ?? 200)
+const PORT_ATTEMPTS = Number.isFinite(CONFIGURED_ATTEMPTS) ? Math.max(1, Math.floor(CONFIGURED_ATTEMPTS)) : 200
 const HOST = process.env.HOST ?? "127.0.0.1"
 const BASE_URL = (process.env.CMDC_BASE_URL ?? "https://api.commandcode.ai").replace(/\/+$/, "")
 const AUTH_PATH = process.env.CMDC_AUTH_PATH ?? path.join(os.homedir(), ".commandcode", "auth.json")
@@ -364,12 +364,14 @@ function startServer(attempt = 0) {
   const server = http.createServer(handleRequest)
   const onListenError = (error) => {
     const canRetry =
-      error?.code === "EADDRINUSE" &&
+      (error?.code === "EADDRINUSE" || error?.code === "EACCES") &&
       PORT !== 0 &&
       attempt + 1 < PORT_ATTEMPTS &&
       PORT + attempt + 1 <= 65535
     if (canRetry) {
-      logWarn(`port ${port} is in use, trying ${PORT + attempt + 1}`)
+      if (attempt === 0) {
+        logWarn(`port ${port} is unavailable (${error.code}); trying later ports`)
+      }
       setImmediate(() => startServer(attempt + 1))
       return
     }

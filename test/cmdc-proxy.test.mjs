@@ -112,6 +112,31 @@ test("streams and aggregates chat completions", async (t) => {
   assert.equal(JSON.parse(json.text).choices[0].message.content, "hello")
 })
 
+test("falls back to the next port when the preferred port is occupied", async (t) => {
+  const occupied = http.createServer((_request, response) => {
+    response.writeHead(200)
+    response.end("occupied")
+  })
+  await new Promise((resolve) => occupied.listen(0, "127.0.0.1", resolve))
+  const occupiedPort = occupied.address().port
+  const proxy = await startProxy(async (request, response) => {
+    await readRequestBody(request)
+    writeCommandEvents(response, textEvents())
+  }, {
+    PORT: String(occupiedPort),
+    PORT_ATTEMPTS: "3",
+  })
+  t.after(async () => {
+    await proxy.close()
+    await new Promise((resolve) => occupied.close(resolve))
+  })
+
+  assert.notEqual(new URL(proxy.base).port, String(occupiedPort))
+  assert.match(proxy.logs, new RegExp(`port ${occupiedPort} is unavailable \\(EADDRINUSE\\)`))
+  const health = await fetch(proxy.base.replace(/\/v1$/, "") + "/health")
+  assert.equal(health.status, 200)
+})
+
 test("retries an upstream stream with no output before the first event", async (t) => {
   let calls = 0
   const proxy = await startProxy(async (request, response) => {

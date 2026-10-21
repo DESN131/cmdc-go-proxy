@@ -34,7 +34,7 @@ node cmdc-proxy.mjs
 
 The default endpoint is `http://127.0.0.1:8787/v1`.
 
-If the preferred port is in use, the proxy automatically tries the next ports (up to `PORT_ATTEMPTS`) and prints the actual listening address at startup.
+If the preferred port is occupied or unavailable due to an OS exclusion/permission error, the proxy automatically tries the next ports (up to `PORT_ATTEMPTS`) and prints the actual listening address at startup.
 
 Each request log includes a timestamp, status, model, stream mode, input/output/total tokens, cached and reasoning tokens, total elapsed time, first-token latency (TTFT), the observed generation window, and output tokens per second measured over that window.
 
@@ -153,7 +153,7 @@ This keeps clients such as Cherry Studio working when reasoning is disabled.
 | --- | --- | --- |
 | `PORT` | `8787` | Listen port |
 | `HOST` | `127.0.0.1` | Listen host |
-| `PORT_ATTEMPTS` | `20` | Try up to this many consecutive ports when the preferred port is in use |
+| `PORT_ATTEMPTS` | `200` | Try up to this many consecutive ports when the preferred port is occupied or unavailable |
 | `LOG_TIME_ZONE` | `Asia/Hong_Kong` | Time zone used for log timestamps |
 | `CMDC_BASE_URL` | `https://api.commandcode.ai` | Upstream base URL |
 | `CMDC_AUTH_PATH` | `~/.commandcode/auth.json` | Command Code login file |

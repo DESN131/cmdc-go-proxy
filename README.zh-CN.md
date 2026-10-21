@@ -34,7 +34,7 @@ node cmdc-proxy.mjs
 
 默认地址：`http://127.0.0.1:8787/v1`。
 
-如果首选端口已被占用，代理会自动尝试后续端口（最多 `PORT_ATTEMPTS` 个），并在启动日志中打印实际监听地址。
+如果首选端口已被占用，或因系统端口保留、权限限制而不可用，代理会自动尝试后续端口（最多 `PORT_ATTEMPTS` 个），并在启动日志中打印实际监听地址。
 
 每个请求日志包含时间、状态码、模型、流式模式、输入/输出/总 token、缓存与推理 token、总耗时、首 token 延迟（TTFT）、实际生成窗口，以及按该窗口计算的输出速度（tok/s）。
 
@@ -153,7 +153,7 @@ Command Code 接受 `off`、`low`、`medium`、`high`、`xhigh`、`max`。代理
 | --- | --- | --- |
 | `PORT` | `8787` | 监听端口 |
 | `HOST` | `127.0.0.1` | 监听地址 |
-| `PORT_ATTEMPTS` | `20` | 首选端口被占用时，最多向后尝试的连续端口数 |
+| `PORT_ATTEMPTS` | `200` | 首选端口被占用或不可用时，最多向后尝试的连续端口数 |
 | `LOG_TIME_ZONE` | `Asia/Hong_Kong` | 日志时间戳使用的时区 |
 | `CMDC_BASE_URL` | `https://api.commandcode.ai` | 上游基础地址 |
 | `CMDC_AUTH_PATH` | `~/.commandcode/auth.json` | Command Code 登录文件 |
